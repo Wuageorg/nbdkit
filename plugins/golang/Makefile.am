@@ -51,6 +51,8 @@ EXTRA_DIST = \
 	examples/minimal/go.mod \
 	examples/ramdisk/ramdisk.go \
 	examples/ramdisk/go.mod \
+	examples/t0rrent/t0rrent.go \
+	examples/t0rrent/go.mod \
 	nbdkit-golang-plugin.pod \
 	$(NULL)
 
@@ -66,6 +68,7 @@ noinst_DATA = \
 	examples/dump-plugin/nbdkit-godump-plugin.so \
 	examples/minimal/nbdkit-gominimal-plugin.so \
 	examples/ramdisk/nbdkit-goramdisk-plugin.so \
+	examples/t0rrent/nbdkit-got0rrent-plugin.so \
 	$(NULL)
 
 examples/disk/nbdkit-godisk-plugin.so: \
@@ -91,6 +94,12 @@ examples/ramdisk/nbdkit-goramdisk-plugin.so: \
 	cd $(srcdir)/examples/ramdisk && \
 	PKG_CONFIG_PATH="$(abs_top_builddir)/server/local$${PKG_CONFIG_PATH:+:$$PKG_CONFIG_PATH}" \
 	$(GOLANG) build -o $(abs_builddir)/examples/ramdisk/nbdkit-goramdisk-plugin.so -buildmode=c-shared
+
+examples/t0rrent/nbdkit-got0rrent-plugin.so: \
+	    $(plugin_sources) examples/t0rrent/t0rrent.go
+	cd $(srcdir)/examples/t0rrent && \
+	PKG_CONFIG_PATH="$(abs_top_builddir)/server/local$${PKG_CONFIG_PATH:+:$$PKG_CONFIG_PATH}" \
+	$(GOLANG) build -o $(abs_builddir)/examples/t0rrent/nbdkit-got0rrent-plugin.so -buildmode=c-shared
 
 # Tests.
 TESTS = dump-plugin-examples.sh
