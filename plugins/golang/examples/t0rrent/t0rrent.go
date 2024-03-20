@@ -35,6 +35,7 @@ import (
 
 
 // FIXME how to not compile anacrolix webrtc stuff
+// TODO benchmark with rusage and ram graph tui
 
 // 💾💾💾💾💾💾💾💾
 // 💾💾💾💾💾💾💾💾
@@ -46,12 +47,14 @@ import (
 type StorLinuxCache struct {
 	ts.ClientImpl
 
+	nbdmount string
 	torrs   map[metainfo.Hash]*TorrStorLinuxCache
 	mu      sync.Mutex
 }
 
-func NewStorage() *StorLinuxCache {
+func NewStorage(nbdmount string) *StorLinuxCache {
 	stor := new(StorLinuxCache)
+	stor.nbdmount = nbdmount
 	stor.torrs = make(map[metainfo.Hash]*TorrStorLinuxCache)
 	return stor
 }
@@ -59,8 +62,7 @@ func NewStorage() *StorLinuxCache {
 func (s *StorLinuxCache) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (ts.TorrentImpl, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	torr := NewTorrent(s)
-	torr.Init(info, infoHash)
+	torr := NewTorrStor(s, info, infoHash)
 	s.torrs[infoHash] = torr
 	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush}, nil //	OE
 }
@@ -105,38 +107,42 @@ type TorrStorLinuxCache struct {
 
 	hash     metainfo.Hash
 	pieceLength int64
-	pieceCount  int
 	isClosed bool
 
-	// seenPieces map[int]*Bool // TODO check kernel cache if the piece as already been seen
+	mu     sync.RWMutex
+	memPieces map[int]*TorrPieceLinuxCache // Pieces that are being downloaded
+	maybeInLinuxCache map[int]bool // Store the id of pieces that maybe in the linux cache
 }
 
-func NewTorrent(storage *StorLinuxCache) *TorrStorLinuxCache {
-	return &TorrStorLinuxCache{}
-}
-
-func (t *TorrStorLinuxCache) Init(info *metainfo.Info, hash metainfo.Hash) {
-	t.pieceLength = info.PieceLength
-	t.pieceCount = info.NumPieces()
-	t.hash = hash
+func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Hash) *TorrStorLinuxCache {
+	return &TorrStorLinuxCache{
+		pieceLength: info.PieceLength,
+		hash: hash,
+		memPieces: make(map[int]*TorrPieceLinuxCache),
+		maybeInLinuxCache: make(map[int]bool),
+	}
 }
 
 func (t *TorrStorLinuxCache) Piece(m metainfo.Piece) ts.PieceImpl {
-	return &PieceFake{}
-	// idx := m.Index()
-	// if idx >= t.pieceCount {
-	// 	return &PieceFake{}
-	// }
-	// t.muPieces.Lock()
-	// defer t.muPieces.Unlock()
-	// if val, ok := t.inFlightPiecesMap[idx]; ok {
-	// 	return t.inFlightPieces[val]
-	// } else {
-	// 	p := NewMemPiece(i, c.pieceLength)
-	// 	append(t.inFlightPieces, p)
-	// 	t.inFlightPiecesMap[idx] = t.inFlightPieces.len - 1
-	// 	return p
-	// }
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	id := m.Index()
+	if p, ok := t.memPieces[id]; ok {
+		return p
+	}
+	if isIn, ok := t.maybeInLinuxCache[id]; ok && isIn {
+		return nil // TODO
+	}
+	size := m.Length()
+	p := &TorrPieceLinuxCache{
+		id: id,
+		size: size,
+		buf: make([]byte, size, size),
+	}
+	log.Println("Piece(", id, m.Offset(), m.Length(), ")")
+	t.memPieces[id] = p
+	return p
 }
 
 // func (t *TorrStorLinuxCache) AdjustRA(readahead int64) {
@@ -159,29 +165,42 @@ func (t *TorrStorLinuxCache) Flush() error {
 	return nil
 }
 
-type PieceFake struct{}
+type TorrPieceLinuxCache struct {
+	id int
+	size int64
+	complete bool
 
-func (PieceFake) ReadAt(p []byte, off int64) (n int, err error) {
-	err = errors.New("fake")
-	return
+	buf []byte
+	mu     sync.RWMutex
 }
 
-func (PieceFake) WriteAt(p []byte, off int64) (n int, err error) {
-	err = errors.New("fake")
-	return
+func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (n int, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	log.Println("ReadAt(", p.id, ")", off, " ", len(b))
+	return copy(b, p.buf[off:int(off) + len(b)]), nil
 }
 
-func (PieceFake) MarkComplete() error {
-	return errors.New("fake")
+func (p *TorrPieceLinuxCache) WriteAt(b []byte, off int64) (n int, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// log.Println("WriteAt(", p.id, ")", off, " ", len(b))
+	return copy(p.buf[off:], b), nil
 }
 
-func (PieceFake) MarkNotComplete() error {
-	return errors.New("fake")
+func (p *TorrPieceLinuxCache) MarkComplete() error {
+	p.complete = true
+	return nil
 }
 
-func (PieceFake) Completion() ts.Completion {
+func (p *TorrPieceLinuxCache) MarkNotComplete() error {
+	p.complete = false
+	return nil
+}
+
+func (p *TorrPieceLinuxCache) Completion() ts.Completion {
 	return ts.Completion{
-		Complete: false,
+		Complete: p.complete,
 		Ok:       true,
 		Err:      nil,
 	}
@@ -198,6 +217,7 @@ func (PieceFake) Completion() ts.Completion {
 type T0rrentPlugin struct {
 	nbdkit.Plugin // iface
 	magnet string
+	nbdmount string
 	tManager *torrent.Client
 	t *torrent.Torrent
 }
@@ -216,15 +236,20 @@ func (p *T0rrentPlugin) Config(key string, value string) error {
 		} else {
 			p.magnet = "magnet:?xt=urn:btih:" + value
 		}
-		return nil
+	} else if key == "nbdmount" {
+		p.nbdmount = value
 	} else {
 		return nbdkit.PluginError{Errmsg: "unknown parameter"}
 	}
+	return nil
 }
 
 func (p *T0rrentPlugin) ConfigComplete() error {
 	if len(p.magnet) == 0 {
 		return nbdkit.PluginError{Errmsg: "magnet parameter is required"}
+	}
+	if len(p.nbdmount) == 0 {
+		return nbdkit.PluginError{Errmsg: "nbdmount parameter is required"}
 	}
 	return nil
 }
@@ -237,7 +262,7 @@ func (p *T0rrentPlugin) GetReady() error {
 	torrentCfg.DisableIPv4 = false
 	torrentCfg.DisableTCP = true
 	torrentCfg.DisableUTP = false
-	torrentCfg.DefaultStorage = NewStorage()
+	torrentCfg.DefaultStorage = NewStorage(p.nbdmount)
 	// torrentCfg.Debug = true
 
 	var err error
@@ -276,7 +301,7 @@ func (p *T0rrentPlugin) GetReady() error {
 func (p *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
 	return &T0rrentConnection{
 		plugin: p,
-		reader: p.t.NewReader(),
+		reader: p.t.NewReader(), // One reader per connections
 	}, nil
 }
 
@@ -293,23 +318,33 @@ func (c *T0rrentConnection) CanWrite() (bool, error) {
 	return false, nil
 }
 
-func (c *T0rrentConnection) PRead(buf []byte, offset uint64,
+func (c *T0rrentConnection) PWrite(buf []byte, offset uint64,
 	flags uint32) error {
-	log.Println("Read Offset: ", offset, " flags: ", flags)
-
-	newPos, err := c.reader.Seek(int64(offset), io.SeekStart)
-	if err != nil {
-		return err
-	}
-	if newPos != int64(offset) {
-		log.Println("SEEK FAILED OFFSET %d SEEKTO %d", offset, newPos)
-	}
-	_, err = c.reader.Read(buf)
 	return nil
 }
 
-func (c *T0rrentConnection) PWrite(buf []byte, offset uint64,
-	flags uint32) error {
+func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error {
+	bsz := len(buf)
+	// log.Println("PRead(", offset, bsz, flags)
+
+	newPos, err := c.reader.Seek(int64(offset), io.SeekStart)
+	if err != nil || newPos != int64(offset) {
+		if err == nil {
+			err = errors.New("Seek failed")
+		}
+		return err
+	}
+	copied := 0
+	for copied < bsz {
+		if copied != 0 {
+			log.Println("second read!", copied, len(buf))
+		}
+		r, err := c.reader.Read(buf[copied:])
+		if err != nil {
+			return err
+		}
+		copied += r
+	}
 	return nil
 }
 
