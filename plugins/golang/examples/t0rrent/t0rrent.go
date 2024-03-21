@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 
 	"log"
+	"fmt"
 	"io"
 	"sync"
 	"errors"
@@ -286,14 +287,14 @@ func (p *T0rrentPlugin) GetReady() error {
 	// func (t *Torrent) Piece(i pieceIndex) *Piece
 	// func (t *Torrent) SubscribePieceStateChanges() *pubsub.Subscription[PieceStateChange]
 	<-p.t.GotInfo() // wait till with get torrent infos
-	log.Println("InfoHash", p.t.InfoHash())
-	log.Println("Name", p.t.Info().BestName())
-	log.Println("Piece Length", p.t.Info().PieceLength)
-	log.Println("CreationDate", p.t.Metainfo().CreationDate)
-	log.Println("CreatedBy", p.t.Metainfo().CreatedBy)
-	log.Println("Comment", p.t.Metainfo().Comment)
+	nbdkit.Debug(fmt.Sprint("InfoHash ", p.t.InfoHash()))
+	nbdkit.Debug(fmt.Sprint("Name ", p.t.Info().BestName()))
+	nbdkit.Debug(fmt.Sprint("Pieces Length ", p.t.Info().PieceLength))
+	nbdkit.Debug(fmt.Sprint("CreationDate ",p.t.Metainfo().CreationDate))
+	nbdkit.Debug(fmt.Sprint("CreatedBy ", p.t.Metainfo().CreatedBy))
+	nbdkit.Debug(fmt.Sprint("Comment ", p.t.Metainfo().Comment))
 	for _, f := range p.t.Files() {
-		log.Println("File", f.Path(), f.Length())
+		nbdkit.Debug(fmt.Sprint("File ", f.Path(), " ", f.Length()))
 	}
 	return nil
 }
@@ -342,6 +343,9 @@ func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error
 		r, err := c.reader.Read(buf[copied:])
 		if err != nil {
 			return err
+		}
+		if r != len(buf) {
+			log.Println("READ LESS THAN DESIRED", r, len(buf))
 		}
 		copied += r
 	}
