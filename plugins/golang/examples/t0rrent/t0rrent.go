@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"errors"
 	"strings"
 
 	"libguestfs.org/nbdkit"
@@ -103,9 +102,6 @@ func (s *StorLinuxCache) GetCache(hash metainfo.Hash) *TorrStorLinuxCache {
 
 type TorrStorLinuxCache struct {
 	// iface ts.TorrentImpl
-	// stor *StorLinuxCache
-	Capacity ts.TorrentCapacity
-
 	hash     metainfo.Hash
 	pieceLength int64
 	isClosed bool
@@ -127,34 +123,17 @@ func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Has
 func (t *TorrStorLinuxCache) Piece(m metainfo.Piece) ts.PieceImpl {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
 	id := m.Index()
-	if p, ok := t.memPieces[id]; ok {
-		return p
-	}
-	if isIn, ok := t.maybeInLinuxCache[id]; ok && isIn {
-		return nil // TODO
-	}
 	size := m.Length()
 	p := &TorrPieceLinuxCache{
 		id: id,
 		size: size,
 		buf: make([]byte, size, size),
 	}
-	log.Println("Piece(", id, m.Offset(), m.Length(), ")")
 	t.memPieces[id] = p
+	log.Println("Piece(", id, m.Offset(), m.Length(), ")")
 	return p
 }
-
-// func (t *TorrStorLinuxCache) AdjustRA(readahead int64) {
-// 	if t.Readers() > 0 {
-// 		t.muReaders.Lock()
-// 		for r := range t.readers {
-// 			r.SetReadahead(readahead)
-// 		}
-// 		t.muReaders.Unlock()
-// 	}
-// }
 
 func (t *TorrStorLinuxCache) Close() error {
 	t.isClosed = true
@@ -178,6 +157,8 @@ type TorrPieceLinuxCache struct {
 func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (n int, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// TODO if complete, check if in linux cache
+
 	log.Println("ReadAt(", p.id, ")", off, " ", len(b))
 	return copy(b, p.buf[off:int(off) + len(b)]), nil
 }
@@ -255,6 +236,12 @@ func (p *T0rrentPlugin) ConfigComplete() error {
 	return nil
 }
 
+func (p *T0rrentPlugin) Unload() {
+	if p.tManager != nil {
+		p.tManager.Close()
+	}
+}
+
 func (p *T0rrentPlugin) GetReady() error {
 	torrentCfg:= torrent.NewDefaultClientConfig()
 	torrentCfg.Seed = true
@@ -286,7 +273,7 @@ func (p *T0rrentPlugin) GetReady() error {
 	// func (t *Torrent) NumPieces() pieceIndex
 	// func (t *Torrent) Piece(i pieceIndex) *Piece
 	// func (t *Torrent) SubscribePieceStateChanges() *pubsub.Subscription[PieceStateChange]
-	<-p.t.GotInfo() // wait till with get torrent infos
+	<-p.t.GotInfo() // wait till with get torrent infos // TODO timeout and fail
 	nbdkit.Debug(fmt.Sprint("InfoHash ", p.t.InfoHash()))
 	nbdkit.Debug(fmt.Sprint("Name ", p.t.Info().BestName()))
 	nbdkit.Debug(fmt.Sprint("Pieces Length ", p.t.Info().PieceLength))
@@ -326,12 +313,13 @@ func (c *T0rrentConnection) PWrite(buf []byte, offset uint64,
 
 func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error {
 	bsz := len(buf)
-	// log.Println("PRead(", offset, bsz, flags)
-
 	newPos, err := c.reader.Seek(int64(offset), io.SeekStart)
 	if err != nil || newPos != int64(offset) {
 		if err == nil {
-			err = errors.New("Seek failed")
+			err = nbdkit.PluginError{
+				Errmsg: "Seek failed",
+				Errno: 29, // ESPIPE
+			}
 		}
 		return err
 	}
