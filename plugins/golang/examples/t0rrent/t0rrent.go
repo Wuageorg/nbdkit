@@ -107,16 +107,15 @@ type TorrStorLinuxCache struct {
 	isClosed bool
 
 	mu     sync.RWMutex
-	memPieces map[int]*TorrPieceLinuxCache // Pieces that are being downloaded
-	maybeInLinuxCache map[int]bool // Store the id of pieces that maybe in the linux cache
+	memPieces []TorrPieceLinuxCache // Pieces that are being downloaded
 }
 
 func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Hash) *TorrStorLinuxCache {
+	pcnt := info.NumPieces()
 	return &TorrStorLinuxCache{
 		pieceLength: info.PieceLength,
 		hash: hash,
-		memPieces: make(map[int]*TorrPieceLinuxCache),
-		maybeInLinuxCache: make(map[int]bool),
+		memPieces: make([]TorrPieceLinuxCache, pcnt, pcnt),
 	}
 }
 
@@ -125,19 +124,18 @@ func (t *TorrStorLinuxCache) Piece(m metainfo.Piece) ts.PieceImpl {
 	defer t.mu.Unlock()
 	id := m.Index()
 	size := m.Length()
-	p := &TorrPieceLinuxCache{
-		id: id,
-		size: size,
-		buf: make([]byte, size, size),
+	p := &t.memPieces[id]
+	if p.size == 0 {
+		p.id = id
+		p.size = size
+		p.buf = make([]byte, size, size)
 	}
-	t.memPieces[id] = p
-	log.Println("Piece(", id, m.Offset(), m.Length(), ")")
+	log.Println("Piece(", p.id, m.Offset(), p.size, p.complete, ")")
 	return p
 }
 
 func (t *TorrStorLinuxCache) Close() error {
 	t.isClosed = true
-	// t.stor.CloseHash(t.hash)
 	return nil
 }
 
@@ -166,7 +164,6 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (n int, err error) {
 func (p *TorrPieceLinuxCache) WriteAt(b []byte, off int64) (n int, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// log.Println("WriteAt(", p.id, ")", off, " ", len(b))
 	return copy(p.buf[off:], b), nil
 }
 
@@ -264,6 +261,7 @@ func (p *T0rrentPlugin) GetReady() error {
 		return err
 	}
 	p.t.SetDisplayName("Downloading torrent metadata");
+	// p.t.PieceState()
 	// func (t *Torrent) AddWebSeeds(urls []string, opts ...AddWebSeedsOpt)
 	// func (t *Torrent) AddTrackers(announceList [][]string)
 	// func (t *Torrent) AddPeers(pp []PeerInfo) (n int)
@@ -287,6 +285,7 @@ func (p *T0rrentPlugin) GetReady() error {
 }
 
 func (p *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
+	// TODO wait for GoTInfo here
 	return &T0rrentConnection{
 		plugin: p,
 		reader: p.t.NewReader(), // One reader per connections
