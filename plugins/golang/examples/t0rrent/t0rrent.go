@@ -130,7 +130,7 @@ func (t *TorrStorLinuxCache) Piece(m metainfo.Piece) ts.PieceImpl {
 		p.size = size
 		p.buf = make([]byte, size, size)
 	}
-	log.Println("Piece(", p.id, m.Offset(), p.size, p.complete, ")")
+	// log.Println("Piece(", p.id, m.Offset(), p.size, p.complete, ")")
 	return p
 }
 
@@ -152,18 +152,19 @@ type TorrPieceLinuxCache struct {
 	mu     sync.RWMutex
 }
 
-func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (n int, err error) {
+func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// TODO if complete, check if in linux cache
 
-	log.Println("ReadAt(", p.id, ")", off, " ", len(b))
+	// log.Println("ReadAt(", p.id, ")", off, " ", len(b))
 	return copy(b, p.buf[off:int(off) + len(b)]), nil
 }
 
-func (p *TorrPieceLinuxCache) WriteAt(b []byte, off int64) (n int, err error) {
+func (p *TorrPieceLinuxCache) WriteAt(b []byte, off int64) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	log.Println("WriteAt", p.id, len(p.buf), off, len(b))
 	return copy(p.buf[off:], b), nil
 }
 
@@ -248,7 +249,7 @@ func (p *T0rrentPlugin) GetReady() error {
 	torrentCfg.DisableTCP = true
 	torrentCfg.DisableUTP = false
 	torrentCfg.DefaultStorage = NewStorage(p.nbdmount)
-	// torrentCfg.Debug = true
+	torrentCfg.Debug = true
 
 	var err error
 	p.tManager, err = torrent.NewClient(torrentCfg)
@@ -324,16 +325,16 @@ func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error
 	}
 	copied := 0
 	for copied < bsz {
-		if copied != 0 {
-			log.Println("second read!", copied, len(buf))
-		}
+		// if copied != 0 {
+		// 	log.Println("second read!", copied, len(buf))
+		// }
 		r, err := c.reader.Read(buf[copied:])
 		if err != nil {
 			return err
 		}
-		if r != len(buf) {
-			log.Println("READ LESS THAN DESIRED", r, len(buf))
-		}
+		// if r != len(buf) {
+		// 	log.Println("READ LESS THAN DESIRED", r, len(buf))
+		// }
 		copied += r
 	}
 	return nil
