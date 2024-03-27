@@ -183,12 +183,12 @@ type RAMPiece struct {
 func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(buf))
 
-	rp.Lock()
-	n := copy(buf, rp.data[lo:hi:hi])
-	rp.Unlock()
-
 	// TODO if complete, check if in linux cache
-	return n, nil
+
+	rp.Lock()
+	defer rp.Unlock()
+
+	return copy(buf, rp.data[lo:hi:hi]), nil
 }
 
 // WriteAt writes data to a piece at the specified offset.
@@ -196,26 +196,34 @@ func (rp *RAMPiece) WriteAt(buf []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(buf))
 
 	rp.Lock()
-	n := copy(rp.data[lo:hi:hi], buf)
-	rp.Unlock()
+	defer rp.Unlock()
 
-	return n, nil
+	return copy(rp.data[lo:hi:hi], buf), nil
 }
 
 // MarkComplete marks a piece as complete.
 func (rp *RAMPiece) MarkComplete() error {
+	rp.Lock()
 	rp.done = true
+	rp.Unlock()
+
 	return nil
 }
 
 // MarkNotComplete marks a piece as not complete.
 func (rp *RAMPiece) MarkNotComplete() error {
+	rp.Lock()
 	rp.done = false
+	rp.Unlock()
+
 	return nil
 }
 
 // Completion returns the completion status of a piece.
 func (rp *RAMPiece) Completion() storage.Completion {
+	rp.RLock()
+	defer rp.Unlock()
+
 	return storage.Completion{
 		Complete: rp.done,
 		Ok:       true,
