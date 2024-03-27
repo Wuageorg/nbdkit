@@ -10,6 +10,8 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
+
 	// Third-party package imports
 	"libguestfs.org/nbdkit" // NBD server library
 
@@ -39,6 +41,8 @@ import (
 // 💾💾 Storage
 // 💾💾💾💾💾💾💾💾
 // 💾💾💾💾💾💾💾💾
+
+const TIMEOUT = 10
 
 // RAMStorage represents an in-memory storage implementation for torrents.
 type RAMStorage struct {
@@ -293,7 +297,13 @@ func (tp *T0rrentPlugin) GetReady() error {
 	// func (t *Torrent) NumPieces() pieceIndex
 	// func (t *Torrent) Piece(i pieceIndex) *Piece
 	// func (t *Torrent) SubscribePieceStateChanges() *pubsub.Subscription[PieceStateChange]
-	<-tp.torrent.GotInfo() // wait till with get torrent infos // TODO timeout and fail
+
+	select {
+	case <-tp.torrent.GotInfo():
+		nbdkit.Debug(fmt.Sprint("Got torrent %s infos", tp.torrent.InfoHash()))
+	case <-time.After(TIMEOUT * time.Second):
+		return fmt.Errorf("Did not got torrent %s infos in %d seconds", tp.torrent.InfoHash(), TIMEOUT)
+	}
 
 	nbdkit.Debug(fmt.Sprint("InfoHash ", tp.torrent.InfoHash()))
 	nbdkit.Debug(fmt.Sprint("Name ", tp.torrent.Info().BestName()))
