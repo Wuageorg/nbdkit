@@ -9,6 +9,7 @@ require libguestfs.org/nbdkit v1.0.0
 require github.com/anacrolix/torrent v1.54.1
 
 require (
+	crawshaw.io/sqlite v0.3.3-0.20220618202545-d1964889ea3c // indirect
 	github.com/RoaringBitmap/roaring v1.2.3 // indirect
 	github.com/ajwerner/btree v0.0.0-20211221152037-f427b3e689c0 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect

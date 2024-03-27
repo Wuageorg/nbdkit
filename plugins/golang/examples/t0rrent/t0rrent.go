@@ -48,14 +48,14 @@ type StorLinuxCache struct {
 	ts.ClientImpl
 
 	nbdmount string
-	torrs   map[metainfo.Hash]*TorrStorLinuxCache
+	torrs   map[string]*TorrStorLinuxCache
 	mu      sync.Mutex
 }
 
 func NewStorage(nbdmount string) *StorLinuxCache {
 	stor := new(StorLinuxCache)
 	stor.nbdmount = nbdmount
-	stor.torrs = make(map[metainfo.Hash]*TorrStorLinuxCache)
+	stor.torrs = make(map[string]*TorrStorLinuxCache)
 	return stor
 }
 
@@ -63,19 +63,20 @@ func (s *StorLinuxCache) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	torr := NewTorrStor(s, info, infoHash)
-	s.torrs[infoHash] = torr
-	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush}, nil //	OE
+	s.torrs[infoHash.AsString()] = torr
+	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush}, nil
 }
 
 func (s *StorLinuxCache) CloseHash(hash metainfo.Hash) {
 	if s.torrs == nil {
 		return
 	}
+	h := hash.AsString()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if torr, ok := s.torrs[hash]; ok {
+	if torr, ok := s.torrs[h]; ok {
 		torr.Close()
-		delete(s.torrs, hash)
+		delete(s.torrs, h)
 	}
 
 	runtime.GC()
@@ -94,7 +95,7 @@ func (s *StorLinuxCache) Close() error {
 func (s *StorLinuxCache) GetCache(hash metainfo.Hash) *TorrStorLinuxCache {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if torr, ok := s.torrs[hash]; ok {
+	if torr, ok := s.torrs[hash.AsString()]; ok {
 		return torr
 	}
 	return nil
@@ -130,7 +131,6 @@ func (t *TorrStorLinuxCache) Piece(m metainfo.Piece) ts.PieceImpl {
 		p.size = size
 		p.buf = make([]byte, size, size)
 	}
-	// log.Println("Piece(", p.id, m.Offset(), p.size, p.complete, ")")
 	return p
 }
 
@@ -155,16 +155,15 @@ type TorrPieceLinuxCache struct {
 func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// TODO if complete, check if in linux cache
-
-	// log.Println("ReadAt(", p.id, ")", off, " ", len(b))
+	// TODO find a way to know if read comes from nbdkit or another torrent client
+	// if nbdkit, and the whole piece has been read and is complete, we can free the buffer and
+	// resolve future readAt with linux cache
 	return copy(b, p.buf[off:int(off) + len(b)]), nil
 }
 
 func (p *TorrPieceLinuxCache) WriteAt(b []byte, off int64) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	log.Println("WriteAt", p.id, len(p.buf), off, len(b))
 	return copy(p.buf[off:], b), nil
 }
 
@@ -186,6 +185,11 @@ func (p *TorrPieceLinuxCache) Completion() ts.Completion {
 	}
 }
 
+func writeChunkError(err error) {
+	log.Fatalf("writeChunkError %s\n", err)
+	panic(err)
+}
+
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
 // 🎛️🎛️ Plugin
@@ -205,8 +209,9 @@ type T0rrentPlugin struct {
 // The per-nbd-client struct.
 type T0rrentConnection struct {
 	nbdkit.Connection // iface
-	plugin *T0rrentPlugin
+	tsize uint64
 	reader torrent.Reader
+	mu sync.Mutex
 }
 
 func (p *T0rrentPlugin) Config(key string, value string) error {
@@ -249,7 +254,7 @@ func (p *T0rrentPlugin) GetReady() error {
 	torrentCfg.DisableTCP = true
 	torrentCfg.DisableUTP = false
 	torrentCfg.DefaultStorage = NewStorage(p.nbdmount)
-	torrentCfg.Debug = true
+	// torrentCfg.Debug = true
 
 	var err error
 	p.tManager, err = torrent.NewClient(torrentCfg)
@@ -262,6 +267,12 @@ func (p *T0rrentPlugin) GetReady() error {
 		return err
 	}
 	p.t.SetDisplayName("Downloading torrent metadata");
+	p.t.SetOnWriteChunkError(writeChunkError)
+
+	return nil
+}
+
+func (p *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
 	// p.t.PieceState()
 	// func (t *Torrent) AddWebSeeds(urls []string, opts ...AddWebSeedsOpt)
 	// func (t *Torrent) AddTrackers(announceList [][]string)
@@ -272,29 +283,26 @@ func (p *T0rrentPlugin) GetReady() error {
 	// func (t *Torrent) NumPieces() pieceIndex
 	// func (t *Torrent) Piece(i pieceIndex) *Piece
 	// func (t *Torrent) SubscribePieceStateChanges() *pubsub.Subscription[PieceStateChange]
+
 	<-p.t.GotInfo() // wait till with get torrent infos // TODO timeout and fail
 	nbdkit.Debug(fmt.Sprint("InfoHash ", p.t.InfoHash()))
 	nbdkit.Debug(fmt.Sprint("Name ", p.t.Info().BestName()))
 	nbdkit.Debug(fmt.Sprint("Pieces Length ", p.t.Info().PieceLength))
+	nbdkit.Debug(fmt.Sprint("Total Length ", p.t.Length()))
 	nbdkit.Debug(fmt.Sprint("CreationDate ",p.t.Metainfo().CreationDate))
 	nbdkit.Debug(fmt.Sprint("CreatedBy ", p.t.Metainfo().CreatedBy))
 	nbdkit.Debug(fmt.Sprint("Comment ", p.t.Metainfo().Comment))
 	for _, f := range p.t.Files() {
 		nbdkit.Debug(fmt.Sprint("File ", f.Path(), " ", f.Length()))
 	}
-	return nil
-}
-
-func (p *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
-	// TODO wait for GoTInfo here
 	return &T0rrentConnection{
-		plugin: p,
+		tsize: uint64(p.t.Length()),
 		reader: p.t.NewReader(), // One reader per connections
 	}, nil
 }
 
 func (c *T0rrentConnection) GetSize() (uint64, error) {
-	return uint64(c.plugin.t.Length()), nil
+	return c.tsize, nil
 }
 
 // Clients are allowed to make multiple connections safely.
@@ -312,8 +320,12 @@ func (c *T0rrentConnection) PWrite(buf []byte, offset uint64,
 }
 
 func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	bsz := len(buf)
 	newPos, err := c.reader.Seek(int64(offset), io.SeekStart)
+	copied := 0
 	if err != nil || newPos != int64(offset) {
 		if err == nil {
 			err = nbdkit.PluginError{
@@ -323,18 +335,15 @@ func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error
 		}
 		return err
 	}
-	copied := 0
+
 	for copied < bsz {
-		// if copied != 0 {
-		// 	log.Println("second read!", copied, len(buf))
-		// }
 		r, err := c.reader.Read(buf[copied:])
 		if err != nil {
-			return err
+			s, _ := c.GetSize()
+			if err == io.EOF && (offset + uint64(len(buf))) != s {
+				return err
+			}
 		}
-		// if r != len(buf) {
-		// 	log.Println("READ LESS THAN DESIRED", r, len(buf))
-		// }
 		copied += r
 	}
 	return nil
