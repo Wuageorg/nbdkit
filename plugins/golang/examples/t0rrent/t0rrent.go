@@ -4,20 +4,16 @@ import (
 	"C"
 	"unsafe"
 
-	"runtime"
-	"runtime/debug"
-
-	"log"
 	"fmt"
 	"io"
-	"sync"
 	"strings"
+	"sync"
 
 	"libguestfs.org/nbdkit"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
-	ts "github.com/anacrolix/torrent/storage"
+	"github.com/anacrolix/torrent/storage"
 )
 
 // Needs
@@ -33,7 +29,6 @@ import (
 // 7 ipv6
 // 5 dht
 
-
 // FIXME how to not compile anacrolix webrtc stuff
 // TODO benchmark with rusage and ram graph tui
 
@@ -44,143 +39,156 @@ import (
 // 💾💾💾💾💾💾💾💾
 
 // Storage struct
-type StorLinuxCache struct {
-	ts.ClientImpl
-
-	nbdmount string
-	torrs   map[metainfo.Hash]*TorrStorLinuxCache
-	mu      sync.Mutex
+type RAMStorage struct {
+	storage.ClientImpl
+	sync.Mutex
+	device string // "/dev/nbd0"
+	ramtos map[string]*RAMTorrent
 }
 
-func NewStorage(nbdmount string) *StorLinuxCache {
-	stor := new(StorLinuxCache)
-	stor.nbdmount = nbdmount
-	stor.torrs = make(map[metainfo.Hash]*TorrStorLinuxCache)
-	return stor
+func NewRAMStorage(nbdmount string) *RAMStorage {
+	rs := new(RAMStorage)
+	rs.device = nbdmount
+	rs.ramtos = make(map[string]*RAMTorrent)
+	return rs
 }
 
-func (s *StorLinuxCache) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (ts.TorrentImpl, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	torr := NewTorrStor(s, info, infoHash)
-	s.torrs[infoHash] = torr
-	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush}, nil //	OE
+func (rs *RAMStorage) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (storage.TorrentImpl, error) {
+	h := infoHash.AsString()
+	t := NewRAMTorrent(info)
+
+	rs.Lock()
+	rs.ramtos[h] = t
+	rs.Unlock()
+
+	return storage.TorrentImpl{
+		Piece: t.Piece,
+		Close: t.Close,
+		Flush: t.Flush,
+	}, nil //	OE
 }
 
-func (s *StorLinuxCache) CloseHash(hash metainfo.Hash) {
-	if s.torrs == nil {
+func (rs *RAMStorage) CloseTorrent(hash metainfo.Hash) {
+	// defer debug.FreeOSMemory()
+	// defer runtime.GC()
+
+	rs.Lock()
+	defer rs.Unlock()
+
+	if len(rs.ramtos) == 0 {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if torr, ok := s.torrs[hash]; ok {
-		torr.Close()
-		delete(s.torrs, hash)
-	}
 
-	runtime.GC()
-	debug.FreeOSMemory()
+	h := hash.AsString()
+	if t, ok := rs.ramtos[h]; ok {
+		t.Close() // close RAMTorrent
+		delete(rs.ramtos, h)
+	}
 }
 
-func (s *StorLinuxCache) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, torr := range s.torrs {
-		torr.Close()
+func (rs *RAMStorage) Close() {
+	// defer debug.FreeOSMemory()
+	// defer runtime.GC()
+
+	rs.Lock()
+	for _, t := range rs.ramtos {
+		t.Close()
+	}
+	clear(rs.ramtos)
+	rs.Unlock()
+
+	return
+}
+
+func (rs *RAMStorage) GetTorrent(hash metainfo.Hash) *RAMTorrent {
+	h := hash.AsString()
+
+	rs.Lock()
+	defer rs.Unlock()
+
+	if t, ok := rs.ramtos[h]; ok {
+		return t
 	}
 	return nil
 }
 
-func (s *StorLinuxCache) GetCache(hash metainfo.Hash) *TorrStorLinuxCache {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if torr, ok := s.torrs[hash]; ok {
-		return torr
-	}
-	return nil
+type RAMTorrent struct {
+	storage.TorrentImpl
+	sync.RWMutex
+
+	pieces []RAMPiece // Pieces that are being downloaded
 }
 
-type TorrStorLinuxCache struct {
-	// iface ts.TorrentImpl
-	hash     metainfo.Hash
-	pieceLength int64
-	isClosed bool
-
-	mu     sync.RWMutex
-	memPieces []TorrPieceLinuxCache // Pieces that are being downloaded
-}
-
-func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Hash) *TorrStorLinuxCache {
-	pcnt := info.NumPieces()
-	return &TorrStorLinuxCache{
-		pieceLength: info.PieceLength,
-		hash: hash,
-		memPieces: make([]TorrPieceLinuxCache, pcnt, pcnt),
+func NewRAMTorrent(mi *metainfo.Info) *RAMTorrent {
+	return &RAMTorrent{
+		pieces: make([]RAMPiece, mi.NumPieces()),
 	}
 }
 
-func (t *TorrStorLinuxCache) Piece(m metainfo.Piece) ts.PieceImpl {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	id := m.Index()
-	size := m.Length()
-	p := &t.memPieces[id]
-	if p.size == 0 {
-		p.id = id
-		p.size = size
-		p.buf = make([]byte, size, size)
+func (rt *RAMTorrent) Piece(mp metainfo.Piece) storage.PieceImpl {
+	id, plen := mp.Index(), mp.Length()
+
+	rt.Lock()
+	p := &rt.pieces[id]
+
+	// Allocate storage on demand
+	if len(p.data) == 0 {
+		p.data = make([]byte, plen)
 	}
-	// log.Println("Piece(", p.id, m.Offset(), p.size, p.complete, ")")
+	rt.Unlock()
+
 	return p
 }
 
-func (t *TorrStorLinuxCache) Close() error {
-	t.isClosed = true
+func (rt *RAMTorrent) Close() error {
 	return nil
 }
 
-func (t *TorrStorLinuxCache) Flush() error {
+func (rt *RAMTorrent) Flush() error {
 	return nil
 }
 
-type TorrPieceLinuxCache struct {
-	id int
-	size int64
-	complete bool
-
-	buf []byte
-	mu     sync.RWMutex
+type RAMPiece struct {
+	storage.PieceImpl
+	sync.RWMutex
+	done bool
+	data []byte
 }
 
-func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
+	lo, hi := off, off+int64(len(buf))
+
+	rp.Lock()
+	n := copy(buf, rp.data[lo:hi:hi])
+	rp.Unlock()
+
 	// TODO if complete, check if in linux cache
-
-	// log.Println("ReadAt(", p.id, ")", off, " ", len(b))
-	return copy(b, p.buf[off:int(off) + len(b)]), nil
+	return n, nil
 }
 
-func (p *TorrPieceLinuxCache) WriteAt(b []byte, off int64) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	log.Println("WriteAt", p.id, len(p.buf), off, len(b))
-	return copy(p.buf[off:], b), nil
+func (rp *RAMPiece) WriteAt(buf []byte, off int64) (int, error) {
+	lo, hi := off, off+int64(len(buf))
+
+	rp.Lock()
+	n := copy(rp.data[lo:hi:hi], buf)
+	rp.Unlock()
+
+	return n, nil
 }
 
-func (p *TorrPieceLinuxCache) MarkComplete() error {
-	p.complete = true
+func (rp *RAMPiece) MarkComplete() error {
+	rp.done = true
 	return nil
 }
 
-func (p *TorrPieceLinuxCache) MarkNotComplete() error {
-	p.complete = false
+func (rp *RAMPiece) MarkNotComplete() error {
+	rp.done = false
 	return nil
 }
 
-func (p *TorrPieceLinuxCache) Completion() ts.Completion {
-	return ts.Completion{
-		Complete: p.complete,
+func (rp *RAMPiece) Completion() storage.Completion {
+	return storage.Completion{
+		Complete: rp.done,
 		Ok:       true,
 		Err:      nil,
 	}
@@ -196,72 +204,60 @@ func (p *TorrPieceLinuxCache) Completion() ts.Completion {
 
 type T0rrentPlugin struct {
 	nbdkit.Plugin // iface
-	magnet string
-	nbdmount string
-	tManager *torrent.Client
-	t *torrent.Torrent
+	magnet        string
+	device        string
+	client        *torrent.Client
+	torrent       *torrent.Torrent
 }
 
-// The per-nbd-client struct.
-type T0rrentConnection struct {
-	nbdkit.Connection // iface
-	plugin *T0rrentPlugin
-	reader torrent.Reader
-}
-
-func (p *T0rrentPlugin) Config(key string, value string) error {
-	if key == "magnet" {
-		if strings.HasPrefix(value, "magnet:") {
-			p.magnet = value
-		} else {
-			p.magnet = "magnet:?xt=urn:btih:" + value
+func (tp *T0rrentPlugin) Config(key string, value string) error {
+	switch key {
+	case "magnet":
+		tp.magnet = value
+		if !strings.HasPrefix(value, "magnet:") {
+			tp.magnet = fmt.Sprintf("magnet:?xt=urn:btih:%s", value)
 		}
-	} else if key == "nbdmount" {
-		p.nbdmount = value
-	} else {
-		return nbdkit.PluginError{Errmsg: "unknown parameter"}
+	case "nbdmount":
+		tp.device = value
+	default:
+		return nbdkit.PluginError{Errmsg: fmt.Sprintf("unknown parameter %s", key)}
 	}
+
 	return nil
 }
 
-func (p *T0rrentPlugin) ConfigComplete() error {
-	if len(p.magnet) == 0 {
+func (tp *T0rrentPlugin) ConfigComplete() error {
+	switch {
+	case len(tp.magnet) == 0:
 		return nbdkit.PluginError{Errmsg: "magnet parameter is required"}
-	}
-	if len(p.nbdmount) == 0 {
+	case len(tp.device) == 0:
 		return nbdkit.PluginError{Errmsg: "nbdmount parameter is required"}
 	}
 	return nil
 }
 
-func (p *T0rrentPlugin) Unload() {
-	if p.tManager != nil {
-		p.tManager.Close()
-	}
-}
-
-func (p *T0rrentPlugin) GetReady() error {
-	torrentCfg:= torrent.NewDefaultClientConfig()
-	torrentCfg.Seed = true
-	torrentCfg.AcceptPeerConnections = true
-	torrentCfg.DisableIPv6 = false
-	torrentCfg.DisableIPv4 = false
-	torrentCfg.DisableTCP = true
-	torrentCfg.DisableUTP = false
-	torrentCfg.DefaultStorage = NewStorage(p.nbdmount)
-	torrentCfg.Debug = true
+func (tp *T0rrentPlugin) GetReady() error {
+	conf := torrent.NewDefaultClientConfig()
+	conf.Seed = true
+	conf.AcceptPeerConnections = true
+	conf.DisableIPv6 = false
+	conf.DisableIPv4 = false
+	conf.DisableTCP = true
+	conf.DisableUTP = false
+	conf.DefaultStorage = NewRAMStorage(tp.device)
+	conf.Debug = true
 
 	var err error
-	p.tManager, err = torrent.NewClient(torrentCfg)
-	if err != nil {
+
+	if tp.client, err = torrent.NewClient(conf); err != nil {
 		return err
 	}
 
-	p.t, err = p.tManager.AddMagnet(p.magnet);
-	if err != nil {
+	if tp.torrent, err = tp.client.AddMagnet(tp.magnet); err != nil {
 		return err
 	}
-	p.t.SetDisplayName("Downloading torrent metadata");
+
+	tp.torrent.SetDisplayName("Downloading torrent metadata")
 	// p.t.PieceState()
 	// func (t *Torrent) AddWebSeeds(urls []string, opts ...AddWebSeedsOpt)
 	// func (t *Torrent) AddTrackers(announceList [][]string)
@@ -272,70 +268,79 @@ func (p *T0rrentPlugin) GetReady() error {
 	// func (t *Torrent) NumPieces() pieceIndex
 	// func (t *Torrent) Piece(i pieceIndex) *Piece
 	// func (t *Torrent) SubscribePieceStateChanges() *pubsub.Subscription[PieceStateChange]
-	<-p.t.GotInfo() // wait till with get torrent infos // TODO timeout and fail
-	nbdkit.Debug(fmt.Sprint("InfoHash ", p.t.InfoHash()))
-	nbdkit.Debug(fmt.Sprint("Name ", p.t.Info().BestName()))
-	nbdkit.Debug(fmt.Sprint("Pieces Length ", p.t.Info().PieceLength))
-	nbdkit.Debug(fmt.Sprint("CreationDate ",p.t.Metainfo().CreationDate))
-	nbdkit.Debug(fmt.Sprint("CreatedBy ", p.t.Metainfo().CreatedBy))
-	nbdkit.Debug(fmt.Sprint("Comment ", p.t.Metainfo().Comment))
-	for _, f := range p.t.Files() {
-		nbdkit.Debug(fmt.Sprint("File ", f.Path(), " ", f.Length()))
+	<-tp.torrent.GotInfo() // wait till with get torrent infos // TODO timeout and fail
+
+	nbdkit.Debug(fmt.Sprint("InfoHash ", tp.torrent.InfoHash()))
+	nbdkit.Debug(fmt.Sprint("Name ", tp.torrent.Info().BestName()))
+	nbdkit.Debug(fmt.Sprint("Pieces Length ", tp.torrent.Info().PieceLength))
+	nbdkit.Debug(fmt.Sprint("CreationDate ", tp.torrent.Metainfo().CreationDate))
+	nbdkit.Debug(fmt.Sprint("CreatedBy ", tp.torrent.Metainfo().CreatedBy))
+	nbdkit.Debug(fmt.Sprint("Comment ", tp.torrent.Metainfo().Comment))
+
+	for _, f := range tp.torrent.Files() {
+		nbdkit.Debug(fmt.Sprintf("File %s (%d)", f.Path(), f.Length()))
 	}
 	return nil
 }
 
-func (p *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
+func (tp *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
 	// TODO wait for GoTInfo here
 	return &T0rrentConnection{
-		plugin: p,
-		reader: p.t.NewReader(), // One reader per connections
+		size:   uint64(tp.torrent.Length()),
+		reader: tp.torrent.NewReader(), // One reader per connection
 	}, nil
 }
 
-func (c *T0rrentConnection) GetSize() (uint64, error) {
-	return uint64(c.plugin.t.Length()), nil
+func (tp *T0rrentPlugin) Unload() {
+	if tp.client != nil {
+		tp.client.Close()
+	}
+}
+
+// The per-nbd-client struct.
+type T0rrentConnection struct {
+	nbdkit.Connection // iface
+	size              uint64
+	reader            torrent.Reader
+}
+
+func (tc *T0rrentConnection) GetSize() (uint64, error) {
+	return tc.size, nil
 }
 
 // Clients are allowed to make multiple connections safely.
-func (c *T0rrentConnection) CanMultiConn() (bool, error) {
+func (tc *T0rrentConnection) CanMultiConn() (bool, error) {
 	return true, nil
 }
 
-func (c *T0rrentConnection) CanWrite() (bool, error) {
+func (tc *T0rrentConnection) CanWrite() (bool, error) {
 	return false, nil
 }
 
-func (c *T0rrentConnection) PWrite(buf []byte, offset uint64,
-	flags uint32) error {
+func (tc *T0rrentConnection) PWrite(buf []byte, offset uint64, flags uint32) error {
 	return nil
 }
 
-func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error {
-	bsz := len(buf)
-	newPos, err := c.reader.Seek(int64(offset), io.SeekStart)
-	if err != nil || newPos != int64(offset) {
-		if err == nil {
-			err = nbdkit.PluginError{
-				Errmsg: "Seek failed",
-				Errno: 29, // ESPIPE
-			}
-		}
+func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error {
+	pos, err := tc.reader.Seek(int64(offset), io.SeekStart)
+	switch {
+	case err != nil:
 		return err
+	case pos != int64(offset):
+		return nbdkit.PluginError{
+			Errmsg: fmt.Sprintf("Seek failed got: %x expected: %x", pos, offset),
+			Errno:  29, // ESPIPE
+		}
 	}
-	copied := 0
-	for copied < bsz {
-		// if copied != 0 {
-		// 	log.Println("second read!", copied, len(buf))
-		// }
-		r, err := c.reader.Read(buf[copied:])
+
+	nread := 0
+	for nread < len(buf) {
+		n, err := tc.reader.Read(buf[nread:])
 		if err != nil {
 			return err
 		}
-		// if r != len(buf) {
-		// 	log.Println("READ LESS THAN DESIRED", r, len(buf))
-		// }
-		copied += r
+
+		nread += n
 	}
 	return nil
 }
