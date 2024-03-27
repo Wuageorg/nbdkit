@@ -131,27 +131,37 @@ type RAMTorrent struct {
 	pieces []RAMPiece // Pieces that are being downloaded
 }
 
+// NewRAMTorrent creates a new RAMTorrent instance and preallocate memory.
 func NewRAMTorrent(mi *metainfo.Info) *RAMTorrent {
+	// preallocate pieces storage
+	pieces := make([]RAMPiece, mi.NumPieces())
+	plen := mi.PieceLength
+	for i := range pieces {
+		pieces[i].data = make([]byte, plen)
+	}
+
 	return &RAMTorrent{
-		pieces: make([]RAMPiece, mi.NumPieces()),
+		pieces: pieces,
 	}
 }
 
 // Piece returns a piece of the torrent.
 func (rt *RAMTorrent) Piece(mp metainfo.Piece) storage.PieceImpl {
 	rt.Lock()
-	p := &rt.pieces[id]
-
-	// Allocate storage on demand
-	if len(p.data) == 0 {
-		p.data = make([]byte, plen)
-	}
+	p := &rt.pieces[mp.Index()]
 	rt.Unlock()
 
 	return p
 }
 
+// Close closes the torrent and releases the storage.
 func (rt *RAMTorrent) Close() error {
+	rt.Lock()
+	for i := range rt.pieces {
+		rt.pieces[i].Clear()
+	}
+	clear(rt.pieces)
+	rt.Unlock()
 	return nil
 }
 
