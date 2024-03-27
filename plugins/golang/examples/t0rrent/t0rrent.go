@@ -374,6 +374,16 @@ func (tc *T0rrentConnection) CanWrite() (bool, error) {
 	return false, nil
 }
 
+// Close termitates the client connection.
+func (tc *T0rrentConnection) Close() {
+	tc.size = 0
+	err := tc.reader.Close()
+	if err != nil {
+		nbdkit.Debug(err.Error())
+	}
+	return
+}
+
 // PWrite is a noop
 func (tc *T0rrentConnection) PWrite(buf []byte, offset uint64, flags uint32) error {
 	return nil
