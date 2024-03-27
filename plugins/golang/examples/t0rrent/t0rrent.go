@@ -417,8 +417,6 @@ func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) erro
 			// update the number of bytes read
 			nread += n
 		}
-
-		nread += n
 	}
 	return nil
 }
