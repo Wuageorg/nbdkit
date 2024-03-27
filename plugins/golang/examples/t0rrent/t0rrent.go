@@ -1,19 +1,21 @@
+// Package main defines an NBD (Network Block Device) server plugin that serves data from a torrent file.
 package main
 
 import (
 	"C"
 	"unsafe"
 
+	// Standard library imports
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	// Third-party package imports
+	"libguestfs.org/nbdkit" // NBD server library
 
-	"libguestfs.org/nbdkit"
-
-	"github.com/anacrolix/torrent"
-	"github.com/anacrolix/torrent/metainfo"
-	"github.com/anacrolix/torrent/storage"
+	"github.com/anacrolix/torrent"          // Torrent library
+	"github.com/anacrolix/torrent/metainfo" // Metadata handling for torrents
+	"github.com/anacrolix/torrent/storage"  // Torrent storage interfaces
 )
 
 // Needs
@@ -38,7 +40,7 @@ import (
 // 💾💾💾💾💾💾💾💾
 // 💾💾💾💾💾💾💾💾
 
-// Storage struct
+// RAMStorage represents an in-memory storage implementation for torrents.
 type RAMStorage struct {
 	storage.ClientImpl
 	sync.Mutex
@@ -46,6 +48,7 @@ type RAMStorage struct {
 	ramtos map[string]*RAMTorrent
 }
 
+// NewRAMStorage creates a new RAMStorage instance.
 func NewRAMStorage(nbdmount string) *RAMStorage {
 	rs := new(RAMStorage)
 	rs.device = nbdmount
@@ -53,6 +56,7 @@ func NewRAMStorage(nbdmount string) *RAMStorage {
 	return rs
 }
 
+// OpenTorrent opens a torrent for reading.
 func (rs *RAMStorage) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (storage.TorrentImpl, error) {
 	h := infoHash.AsString()
 	t := NewRAMTorrent(info)
@@ -68,6 +72,7 @@ func (rs *RAMStorage) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (
 	}, nil //	OE
 }
 
+// CloseTorrent closes a torrent.
 func (rs *RAMStorage) CloseTorrent(hash metainfo.Hash) {
 	// defer debug.FreeOSMemory()
 	// defer runtime.GC()
@@ -86,6 +91,7 @@ func (rs *RAMStorage) CloseTorrent(hash metainfo.Hash) {
 	}
 }
 
+// Close closes the storage and releases associated resources.
 func (rs *RAMStorage) Close() {
 	// defer debug.FreeOSMemory()
 	// defer runtime.GC()
@@ -100,6 +106,7 @@ func (rs *RAMStorage) Close() {
 	return
 }
 
+// GetTorrent retrieves a torrent by its hash.
 func (rs *RAMStorage) GetTorrent(hash metainfo.Hash) *RAMTorrent {
 	h := hash.AsString()
 
@@ -112,6 +119,7 @@ func (rs *RAMStorage) GetTorrent(hash metainfo.Hash) *RAMTorrent {
 	return nil
 }
 
+// RAMTorrent represents a torrent stored in memory.
 type RAMTorrent struct {
 	storage.TorrentImpl
 	sync.RWMutex
@@ -125,9 +133,8 @@ func NewRAMTorrent(mi *metainfo.Info) *RAMTorrent {
 	}
 }
 
+// Piece returns a piece of the torrent.
 func (rt *RAMTorrent) Piece(mp metainfo.Piece) storage.PieceImpl {
-	id, plen := mp.Index(), mp.Length()
-
 	rt.Lock()
 	p := &rt.pieces[id]
 
@@ -144,10 +151,13 @@ func (rt *RAMTorrent) Close() error {
 	return nil
 }
 
+// Flush flushes any pending changes to the torrent.
 func (rt *RAMTorrent) Flush() error {
+	// nothing to do
 	return nil
 }
 
+// RAMPiece represents a piece of a torrent stored in memory.
 type RAMPiece struct {
 	storage.PieceImpl
 	sync.RWMutex
@@ -155,6 +165,7 @@ type RAMPiece struct {
 	data []byte
 }
 
+// ReadAt reads data from a piece at the specified offset.
 func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(buf))
 
@@ -166,6 +177,7 @@ func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
 	return n, nil
 }
 
+// WriteAt writes data to a piece at the specified offset.
 func (rp *RAMPiece) WriteAt(buf []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(buf))
 
@@ -176,16 +188,19 @@ func (rp *RAMPiece) WriteAt(buf []byte, off int64) (int, error) {
 	return n, nil
 }
 
+// MarkComplete marks a piece as complete.
 func (rp *RAMPiece) MarkComplete() error {
 	rp.done = true
 	return nil
 }
 
+// MarkNotComplete marks a piece as not complete.
 func (rp *RAMPiece) MarkNotComplete() error {
 	rp.done = false
 	return nil
 }
 
+// Completion returns the completion status of a piece.
 func (rp *RAMPiece) Completion() storage.Completion {
 	return storage.Completion{
 		Complete: rp.done,
@@ -194,22 +209,30 @@ func (rp *RAMPiece) Completion() storage.Completion {
 	}
 }
 
+// Clear resets the RAMPiece, marking it as not complete and clearing its data.
+func (rp *RAMPiece) Clear() {
+	rp.Lock()
+	rp.done = false
+	clear(rp.data)
+	rp.Unlock()
+}
+
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
 // 🎛️🎛️ Plugin
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
 
-// The plugin global struct.
-
+// T0rrentPlugin represents the NBD server plugin for serving torrent data.
 type T0rrentPlugin struct {
-	nbdkit.Plugin // iface
-	magnet        string
-	device        string
-	client        *torrent.Client
-	torrent       *torrent.Torrent
+	nbdkit.Plugin                  // NBD plugin interface
+	magnet        string           // Magnet link for the torrent
+	device        string           // NBD device path
+	client        *torrent.Client  // Torrent client
+	torrent       *torrent.Torrent // Torrent object
 }
 
+// Config processes the plugin configuration parameters.
 func (tp *T0rrentPlugin) Config(key string, value string) error {
 	switch key {
 	case "magnet":
@@ -226,6 +249,7 @@ func (tp *T0rrentPlugin) Config(key string, value string) error {
 	return nil
 }
 
+// ConfigComplete checks if the plugin configuration is complete.
 func (tp *T0rrentPlugin) ConfigComplete() error {
 	switch {
 	case len(tp.magnet) == 0:
@@ -236,6 +260,7 @@ func (tp *T0rrentPlugin) ConfigComplete() error {
 	return nil
 }
 
+// GetReady prepares the plugin for serving torrent data.
 func (tp *T0rrentPlugin) GetReady() error {
 	conf := torrent.NewDefaultClientConfig()
 	conf.Seed = true
@@ -283,6 +308,7 @@ func (tp *T0rrentPlugin) GetReady() error {
 	return nil
 }
 
+// Open prepares the plugin for serving a client connection.
 func (tp *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
 	// TODO wait for GoTInfo here
 	return &T0rrentConnection{
@@ -291,19 +317,21 @@ func (tp *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error)
 	}, nil
 }
 
+// Unload releases resources used by the plugin.
 func (tp *T0rrentPlugin) Unload() {
 	if tp.client != nil {
 		tp.client.Close()
 	}
 }
 
-// The per-nbd-client struct.
+// T0rrentConnection represents a client connection for serving torrent data.
 type T0rrentConnection struct {
-	nbdkit.Connection // iface
+	nbdkit.Connection // connection interface
 	size              uint64
 	reader            torrent.Reader
 }
 
+// GetSize retrieves the size of the torrent data.
 func (tc *T0rrentConnection) GetSize() (uint64, error) {
 	return tc.size, nil
 }
@@ -313,31 +341,43 @@ func (tc *T0rrentConnection) CanMultiConn() (bool, error) {
 	return true, nil
 }
 
+// Clients are NOT allowed to write.
 func (tc *T0rrentConnection) CanWrite() (bool, error) {
 	return false, nil
 }
 
+// PWrite is a noop
 func (tc *T0rrentConnection) PWrite(buf []byte, offset uint64, flags uint32) error {
 	return nil
 }
 
+// PRead reads data from the torrent file at the specified offset into the provided buffer.
 func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error {
+	// seek to the specified offset in the torrent file
 	pos, err := tc.reader.Seek(int64(offset), io.SeekStart)
+
+	// ensure the seek operation landed at the correct position
 	switch {
 	case err != nil:
+		// seeking raised an error
 		return err
 	case pos != int64(offset):
+		// seeking failed to reach the expected position
 		return nbdkit.PluginError{
 			Errmsg: fmt.Sprintf("Seek failed got: %x expected: %x", pos, offset),
 			Errno:  29, // ESPIPE
 		}
 	}
 
-	nread := 0
-	for nread < len(buf) {
-		n, err := tc.reader.Read(buf[nread:])
-		if err != nil {
+	// loop until the buffer is filled or an error occurs
+	for nread := 0; nread < len(buf); {
+		// read data into the buffer from the torrent file
+		if n, err := tc.reader.Read(buf[nread:]); err != nil {
+			// read error
 			return err
+		} else {
+			// update the number of bytes read
+			nread += n
 		}
 
 		nread += n
