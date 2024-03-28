@@ -123,8 +123,8 @@ func (tp *T0rrentPlugin) GetReady() error {
 func (tp *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
 	// TODO wait for GoTInfo here
 	return &T0rrentConnection{
-		size:   uint64(tp.torrent.Length()),
-		reader: tp.torrent.NewReader(), // One reader per connection
+		size:   uint64(tp.torrent.Info().TotalLength()),
+		reader: tp.torrent.NewReader,
 	}, nil
 }
 
@@ -139,7 +139,7 @@ func (tp *T0rrentPlugin) Unload() {
 type T0rrentConnection struct {
 	nbdkit.Connection // connection interface
 	size              uint64
-	reader            torrent.Reader
+	reader            func() torrent.Reader
 }
 
 // GetSize retrieves the size of the torrent data.
@@ -181,7 +181,10 @@ func (tc *T0rrentConnection) Close() {
 // PRead reads data from the torrent file at the specified offset into the provided buffer.
 func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error {
 	// seek to the specified offset in the torrent file
-	pos, err := tc.reader.Seek(int64(offset), io.SeekStart)
+	torrent := tc.reader()
+	defer torrent.Close()
+
+	pos, err := torrent.Seek(int64(offset), io.SeekStart)
 
 	// ensure the seek operation landed at the correct position
 	switch {
@@ -199,7 +202,7 @@ func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) erro
 	// loop until the buffer is filled or an error occurs
 	for nread := 0; nread < len(buf); {
 		// read data into the buffer from the torrent file
-		if n, err := tc.reader.Read(buf[nread:]); err != nil {
+		if n, err := torrent.Read(buf[nread:]); err != nil {
 			// read error
 			return err
 		} else {
