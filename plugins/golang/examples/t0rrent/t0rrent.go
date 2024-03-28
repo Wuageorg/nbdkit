@@ -152,24 +152,30 @@ func (tc *T0rrentConnection) CanMultiConn() (bool, error) {
 	return true, nil
 }
 
+// Clients are NOT allowed to flush.
+func (tc *T0rrentConnection) CanFlush() (bool, error) {
+	return false, nil
+}
+
+// Clients are NOT allowed to trim.
+func (tc *T0rrentConnection) CanTrim() (bool, error) {
+	return false, nil
+}
+
 // Clients are NOT allowed to write.
 func (tc *T0rrentConnection) CanWrite() (bool, error) {
+	return false, nil
+}
+
+// Clients are NOT allowed to zero.
+func (tc *T0rrentConnection) CanZero() (bool, error) {
 	return false, nil
 }
 
 // Close termitates the client connection.
 func (tc *T0rrentConnection) Close() {
 	tc.size = 0
-	err := tc.reader.Close()
-	if err != nil {
-		nbdkit.Debug(err.Error())
-	}
 	return
-}
-
-// PWrite is a noop
-func (tc *T0rrentConnection) PWrite(buf []byte, offset uint64, flags uint32) error {
-	return nil
 }
 
 // PRead reads data from the torrent file at the specified offset into the provided buffer.
