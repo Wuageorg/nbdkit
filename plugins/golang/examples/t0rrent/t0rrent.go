@@ -180,10 +180,14 @@ func (tc *T0rrentConnection) Close() {
 
 // PRead reads data from the torrent file at the specified offset into the provided buffer.
 func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error {
-	// seek to the specified offset in the torrent file
+	// ignore flags
+	_ = flags
+
+	// acquire a torrent file reader
 	torrent := tc.reader()
 	defer torrent.Close()
 
+	// seek to the specified offset in the torrent file
 	pos, err := torrent.Seek(int64(offset), io.SeekStart)
 
 	// ensure the seek operation landed at the correct position
@@ -296,9 +300,9 @@ func (rt *RAMTorrent) Piece(mp metainfo.Piece) storage.PieceImpl {
 // Close closes the torrent and releases the storage.
 func (rt *RAMTorrent) Close() error {
 	for i := range rt.pieces {
-		rt.pieces[i].Clear()
+		rt.pieces[i].Void()
 	}
-	clear(rt.pieces)
+	rt.pieces = nil
 	return nil
 }
 
@@ -359,10 +363,10 @@ func (rp *RAMPiece) Completion() storage.Completion {
 	}
 }
 
-// Clear resets the RAMPiece, marking it as not complete and clearing its data.
-func (rp *RAMPiece) Clear() {
+// Void resets the RAMPiece, marking it as not complete and voiding its data.
+func (rp *RAMPiece) Void() {
 	rp.done = false
-	clear(rp.data)
+	rp.data = nil
 }
 
 //----------------------------------------------------------------------
