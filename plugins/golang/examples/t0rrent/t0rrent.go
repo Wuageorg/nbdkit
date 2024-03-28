@@ -20,224 +20,7 @@ import (
 	"github.com/anacrolix/torrent/storage"  // Torrent storage interfaces
 )
 
-// Needs
-// 14 local peers discovery missing
-// 54 idonthave missing
-// 52 bittorentv2 missing (is on master)
-// torrent modifications
-
-// Have
-// 19 webseeds
-// 29 uTorrent transport protocol
-// 27 private torrents
-// 7 ipv6
-// 5 dht
-
-// FIXME how to not compile anacrolix webrtc stuff
-// TODO benchmark with rusage and ram graph tui
-
-// 💾💾💾💾💾💾💾💾
-// 💾💾💾💾💾💾💾💾
-// 💾💾 Storage
-// 💾💾💾💾💾💾💾💾
-// 💾💾💾💾💾💾💾💾
-
-const TIMEOUT = 10
-
-// RAMStorage represents an in-memory storage implementation for torrents.
-type RAMStorage struct {
-	storage.ClientImpl
-	sync.Mutex
-	device string // "/dev/nbd0"
-	ramtos map[string]*RAMTorrent
-}
-
-// NewRAMStorage creates a new RAMStorage instance.
-func NewRAMStorage(nbdmount string) *RAMStorage {
-	rs := new(RAMStorage)
-	rs.device = nbdmount
-	rs.ramtos = make(map[string]*RAMTorrent)
-	return rs
-}
-
-// OpenTorrent opens a torrent for reading.
-func (rs *RAMStorage) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (storage.TorrentImpl, error) {
-	h := infoHash.AsString()
-	t := NewRAMTorrent(info)
-
-	rs.Lock()
-	rs.ramtos[h] = t
-	rs.Unlock()
-
-	return storage.TorrentImpl{
-		Piece: t.Piece,
-		Close: t.Close,
-		Flush: t.Flush,
-	}, nil //	OE
-}
-
-// CloseTorrent closes a torrent.
-func (rs *RAMStorage) CloseTorrent(hash metainfo.Hash) {
-	// defer debug.FreeOSMemory()
-	// defer runtime.GC()
-
-	rs.Lock()
-	defer rs.Unlock()
-
-	if len(rs.ramtos) == 0 {
-		return
-	}
-
-	h := hash.AsString()
-	if t, ok := rs.ramtos[h]; ok {
-		t.Close() // close RAMTorrent
-		delete(rs.ramtos, h)
-	}
-}
-
-// Close closes the storage and releases associated resources.
-func (rs *RAMStorage) Close() {
-	// defer debug.FreeOSMemory()
-	// defer runtime.GC()
-
-	rs.Lock()
-	for _, t := range rs.ramtos {
-		t.Close()
-	}
-	clear(rs.ramtos)
-	rs.Unlock()
-
-	return
-}
-
-// GetTorrent retrieves a torrent by its hash.
-func (rs *RAMStorage) GetTorrent(hash metainfo.Hash) *RAMTorrent {
-	h := hash.AsString()
-
-	rs.Lock()
-	defer rs.Unlock()
-
-	if t, ok := rs.ramtos[h]; ok {
-		return t
-	}
-	return nil
-}
-
-// RAMTorrent represents a torrent stored in memory.
-type RAMTorrent struct {
-	storage.TorrentImpl
-	sync.RWMutex
-
-	pieces []RAMPiece // Pieces that are being downloaded
-}
-
-// NewRAMTorrent creates a new RAMTorrent instance and preallocate memory.
-func NewRAMTorrent(mi *metainfo.Info) *RAMTorrent {
-	// preallocate pieces storage
-	pieces := make([]RAMPiece, mi.NumPieces())
-	plen := mi.PieceLength
-	for i := range pieces {
-		pieces[i].data = make([]byte, plen)
-	}
-
-	return &RAMTorrent{
-		pieces: pieces,
-	}
-}
-
-// Piece returns a piece of the torrent.
-func (rt *RAMTorrent) Piece(mp metainfo.Piece) storage.PieceImpl {
-	rt.Lock()
-	p := &rt.pieces[mp.Index()]
-	rt.Unlock()
-
-	return p
-}
-
-// Close closes the torrent and releases the storage.
-func (rt *RAMTorrent) Close() error {
-	rt.Lock()
-	for i := range rt.pieces {
-		rt.pieces[i].Clear()
-	}
-	clear(rt.pieces)
-	rt.Unlock()
-	return nil
-}
-
-// Flush flushes any pending changes to the torrent.
-func (rt *RAMTorrent) Flush() error {
-	// nothing to do
-	return nil
-}
-
-// RAMPiece represents a piece of a torrent stored in memory.
-type RAMPiece struct {
-	storage.PieceImpl
-	sync.RWMutex
-	done bool
-	data []byte
-}
-
-// ReadAt reads data from a piece at the specified offset.
-func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
-	lo, hi := off, off+int64(len(buf))
-
-	// TODO if complete, check if in linux cache
-
-	rp.Lock()
-	defer rp.Unlock()
-
-	return copy(buf, rp.data[lo:hi:hi]), nil
-}
-
-// WriteAt writes data to a piece at the specified offset.
-func (rp *RAMPiece) WriteAt(buf []byte, off int64) (int, error) {
-	lo, hi := off, off+int64(len(buf))
-
-	rp.Lock()
-	defer rp.Unlock()
-
-	return copy(rp.data[lo:hi:hi], buf), nil
-}
-
-// MarkComplete marks a piece as complete.
-func (rp *RAMPiece) MarkComplete() error {
-	rp.Lock()
-	rp.done = true
-	rp.Unlock()
-
-	return nil
-}
-
-// MarkNotComplete marks a piece as not complete.
-func (rp *RAMPiece) MarkNotComplete() error {
-	rp.Lock()
-	rp.done = false
-	rp.Unlock()
-
-	return nil
-}
-
-// Completion returns the completion status of a piece.
-func (rp *RAMPiece) Completion() storage.Completion {
-	rp.RLock()
-	defer rp.Unlock()
-
-	return storage.Completion{
-		Complete: rp.done,
-		Ok:       true,
-		Err:      nil,
-	}
-}
-
-// Clear resets the RAMPiece, marking it as not complete and clearing its data.
-func (rp *RAMPiece) Clear() {
-	rp.Lock()
-	rp.done = false
-	clear(rp.data)
-	rp.Unlock()
-}
+var pluginName = "t0rrent"
 
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
@@ -419,6 +202,158 @@ func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) erro
 		}
 	}
 	return nil
+}
+
+// Needs
+// 14 local peers discovery missing
+// 54 idonthave missing
+// 52 bittorentv2 missing (is on master)
+// torrent modifications
+
+// Have
+// 19 webseeds
+// 29 uTorrent transport protocol
+// 27 private torrents
+// 7 ipv6
+// 5 dht
+
+// FIXME how to not compile anacrolix webrtc stuff
+// TODO benchmark with rusage and ram graph tui
+
+// 💾💾💾💾💾💾💾💾
+// 💾💾💾💾💾💾💾💾
+// 💾💾 Storage
+// 💾💾💾💾💾💾💾💾
+// 💾💾💾💾💾💾💾💾
+
+const TIMEOUT = 300
+
+// RAMStorage represents an in-memory storage implementation for torrents.
+type RAMStorage struct {
+	storage.ClientImpl
+	device  string // "/dev/nbd0"
+	torrent *RAMTorrent
+}
+
+// NewRAMStorage creates a new RAMStorage instance.
+func NewRAMStorage(nbdmount string) (rs *RAMStorage) {
+	rs = new(RAMStorage)
+	rs.device = nbdmount
+	return
+}
+
+// OpenTorrent opens a torrent for reading.
+func (rs *RAMStorage) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (storage.TorrentImpl, error) {
+	t := NewRAMTorrent(info)
+	rs.torrent = t
+
+	return storage.TorrentImpl{
+		Piece: t.Piece,
+		Close: t.Close,
+		Flush: t.Flush,
+	}, nil
+}
+
+// RAMTorrent represents a torrent stored in memory.
+type RAMTorrent struct {
+	storage.TorrentImpl
+	sync.RWMutex
+
+	pieces []RAMPiece // Pieces that are being downloaded
+}
+
+// NewRAMTorrent creates a new RAMTorrent instance and preallocate memory.
+func NewRAMTorrent(mi *metainfo.Info) *RAMTorrent {
+	tlen, plen := mi.TotalLength(), mi.PieceLength
+
+	// preallocate pieces storage
+	pieces := make([]RAMPiece, mi.NumPieces())
+	last := len(pieces) - 1
+	for i := range pieces[:last] {
+		pieces[i].data = make([]byte, plen)
+	}
+	pieces[last].data = make([]byte, tlen%plen)
+
+	return &RAMTorrent{
+		pieces: pieces,
+	}
+}
+
+// Piece returns a piece of the torrent.
+func (rt *RAMTorrent) Piece(mp metainfo.Piece) storage.PieceImpl {
+	return &rt.pieces[mp.Index()]
+}
+
+// Close closes the torrent and releases the storage.
+func (rt *RAMTorrent) Close() error {
+	for i := range rt.pieces {
+		rt.pieces[i].Clear()
+	}
+	clear(rt.pieces)
+	return nil
+}
+
+// Flush flushes any pending changes to the torrent.
+func (rt *RAMTorrent) Flush() error {
+	// nothing to do
+	return nil
+}
+
+// RAMPiece represents a piece of a torrent stored in memory.
+type RAMPiece struct {
+	storage.PieceImpl
+	sync.RWMutex
+	done bool
+	data []byte
+}
+
+// ReadAt reads data from a piece at the specified offset.
+func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
+	lo, hi := off, off+int64(len(buf))
+
+	// TODO if complete, check if in linux cache
+
+	rp.RLock()
+	defer rp.RUnlock()
+
+	return copy(buf, rp.data[lo:hi:hi]), nil
+}
+
+// WriteAt writes data to a piece at the specified offset.
+func (rp *RAMPiece) WriteAt(buf []byte, off int64) (int, error) {
+	lo, hi := off, off+int64(len(buf))
+
+	rp.Lock()
+	defer rp.Unlock()
+
+	return copy(rp.data[lo:hi:hi], buf), nil
+}
+
+// MarkComplete marks a piece as complete.
+func (rp *RAMPiece) MarkComplete() error {
+	rp.done = true
+	return nil
+}
+
+// MarkNotComplete marks a piece as not complete.
+func (rp *RAMPiece) MarkNotComplete() error {
+	rp.done = false
+	return nil
+}
+
+// Completion returns the completion status of a piece.
+func (rp *RAMPiece) Completion() storage.Completion {
+	return storage.Completion{
+		Complete: rp.done,
+		Ok:       true,
+		Err:      nil,
+	}
+}
+
+// Clear resets the RAMPiece, marking it as not complete and clearing its data.
+func (rp *RAMPiece) Clear() {
+	rp.done = false
+	clear(rp.data)
 }
 
 //----------------------------------------------------------------------
