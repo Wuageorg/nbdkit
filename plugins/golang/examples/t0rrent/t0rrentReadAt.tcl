@@ -74,8 +74,8 @@ while {[gets stdin line] != -1} {
         set bstate [lindex [regexp -inline {bstate=(\d+)} $line] 1]
 
         # Set the fill color based on the state
-        # violet cache miss
-        set fill_color "violet"
+        # red cache miss
+        set fill_color "red"
         if {$state == 0} {
             # reading from memory
             set fill_color "green"
@@ -85,12 +85,16 @@ while {[gets stdin line] != -1} {
             set fill_color "blue"
         }
         if {$state == 2} {
-            # reading from cache (allegedly)
+            # in cache (allegedly)
+            set fill_color "yellow"
+        }
+        if {$state == 3} {
+            # readin from cache
             set fill_color "orange"
         }
-        if {$state == $bstate} {
+        if {$state != $bstate} {
             # concurrent read and state backoff?
-            set fill_color "red"
+            set fill_color "violet"
         }
 
         # Calculate the coordinates of the corresponding square
@@ -139,4 +143,5 @@ while {[gets stdin line] != -1} {
     } elseif {[regexp {debug: File (.+)} $line -> filename]} {
         wm title . $filename
     }
+    update
 }

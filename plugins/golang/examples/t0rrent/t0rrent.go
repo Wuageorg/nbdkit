@@ -251,14 +251,11 @@ type TorrPieceLinuxCache struct {
 func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(b))
 
-	// if p.state.Load() > 2 {
-	// 	log.Println("--------------------------- ReadAt Piece ", p.id, p.state.Load(), off, len(b))
-	// }
-
 	beforeState := p.state.Load()
 	if beforeState > 2 { // before locking the piece, we check the read loopback situation
 		// cache miss
 		log.Println("!!! READ LOOPBACK", p.id)
+		// TODO tell anacrolix we're imcomplete
 		p.state.Store(0) // set incomplete so caller doesn't loop
 		return 0, syscall.EIO
 	}
@@ -272,6 +269,9 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	}
 	switch state {
 	case 0: // use membuf
+		if p.buf == nil {
+			return 0, syscall.EIO
+		}
 		return copy(b, p.buf[lo:hi:hi]), nil
 	case 1: // not entirely in linux cache
 		n := copy(b, p.buf[lo:hi:hi])
@@ -279,8 +279,8 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 			p.readslots = slots{}
 		}
 		p.readslots = p.readslots.merge(lo, hi) // TODO only merge if the call comes from PRead
-		// log.Println(p.readslots)
-		if len(p.readslots) == 1 && p.readslots[0].start == 0 && p.readslots[0].stop == p.size { // completly read
+		if len(p.readslots) == 1 && p.readslots[0].start == 0 && p.readslots[0].stop == p.size && p.id != 0 { // completly read
+			log.Println("READ COMPLETE", p.id)
 			log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, 2, p.offset, 0, p.size, 2)
 			p.buf = nil // remove buf
 			p.readslots = nil
@@ -290,6 +290,7 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	case 2: // ReadAt from another peer
 		// read in linux cache
 		p.state.Store(3)
+		log.Println("----------------------------------------", p.id)
 		var err error
 		n := 0
 		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, 3, p.offset, lo, hi, 3)
@@ -297,9 +298,11 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		if err != nil {
 			goto cachemiss;
 		}
+		log.Println("in REadat", p.id)
 		if n, err = f.ReadAt(b, p.offset + off); err != nil {
 			goto cachemiss;
 		}
+		log.Println("out REadat cache hit!", p.id)
 		p.state.Store(2)
 		return n, nil
 
@@ -321,6 +324,9 @@ func (p *TorrPieceLinuxCache) WriteAt(b []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(b))
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.buf == nil {
+		return 0, syscall.EIO
+	}
 	return copy(p.buf[lo:hi:hi], b), nil
 }
 
@@ -521,27 +527,27 @@ func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error
 			if err == io.EOF && (offset+uint64(len(buf))) != c.tsize {
 				return err
 			}
-			// On cache miss we get syscall.EIO but we still want to
-			// honor the PRead so try to read a second time
-			if err == syscall.EIO {
-				pos, err := reader.Seek(int64(offset) + int64(nread), io.SeekStart)
-				// ensure the seek operation landed at the correct position
-				switch {
-				case err != nil:
-					return err
-				case pos != int64(offset):
-					return nbdkit.PluginError{
-						Errmsg: "Seek failed",
-						Errno:  29, // ESPIPE
-					}
-				}
-
-				if n, err = reader.Read(buf[nread:]); err != nil {
-					if err == io.EOF && (offset+uint64(len(buf))) != c.tsize {
-						return err
-					}
-				}
-			}
+			// // On cache miss we get syscall.EIO but we still want to
+			// // honor the PRead so try to read a second time
+			// if err == syscall.EIO {
+			// 	pos, err := reader.Seek(int64(offset) + int64(nread), io.SeekStart)
+			// 	// ensure the seek operation landed at the correct position
+			// 	switch {
+			// 	case err != nil:
+			// 		return err
+			// 	case pos != int64(offset):
+			// 		return nbdkit.PluginError{
+			// 			Errmsg: "Seek failed",
+			// 			Errno:  29, // ESPIPE
+			// 		}
+			// 	}
+   //
+			// 	if n, err = reader.Read(buf[nread:]); err != nil {
+			// 		if err == io.EOF && (offset+uint64(len(buf))) != c.tsize {
+			// 			return err
+			// 		}
+			// 	}
+			// }
 		}
 		nread += n
 	}
