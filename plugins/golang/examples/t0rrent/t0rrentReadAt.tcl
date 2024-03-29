@@ -72,30 +72,7 @@ while {[gets stdin line] != -1} {
         set hi [lindex [regexp -inline {hi=(\d+)} $line] 1]
         set state [lindex [regexp -inline {state=(\d+)} $line] 1]
         set bstate [lindex [regexp -inline {bstate=(\d+)} $line] 1]
-
-        # Set the fill color based on the state
-        # red cache miss
-        set fill_color "red"
-        if {$state == 0} {
-            # reading from memory
-            set fill_color "green"
-        }
-        if {$state == 1} {
-            # reading from memory piece is complete
-            set fill_color "blue"
-        }
-        if {$state == 2} {
-            # in cache (allegedly)
-            set fill_color "yellow"
-        }
-        if {$state == 3} {
-            # readin from cache
-            set fill_color "orange"
-        }
-        if {$state != $bstate} {
-            # concurrent read and state backoff?
-            set fill_color "violet"
-        }
+        set fill_color [lindex [regexp -inline {color=(\w+)} $line] 1]
 
         # Calculate the coordinates of the corresponding square
         set square_row [expr {$piece_index / $num_columns}]

@@ -16,8 +16,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 	"syscall"
+	"time"
 
 	"libguestfs.org/nbdkit"
 
@@ -133,7 +133,7 @@ func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Has
 		pieceLength: info.PieceLength,
 		hash:        hash,
 		memPieces:   make([]TorrPieceLinuxCache, pcnt, pcnt),
-		device: device,
+		device:      device,
 	}
 }
 
@@ -164,7 +164,6 @@ func (t *TorrStorLinuxCache) Close() error {
 func (t *TorrStorLinuxCache) Flush() error {
 	return nil
 }
-
 
 type slot struct {
 	start, stop int64
@@ -232,19 +231,19 @@ func (ss slots) merge(lo int64, hi int64) slots {
 
 // TorrPieceLinuxCache represents a piece of a torrent.
 type TorrPieceLinuxCache struct {
-	id       int
-	offset   int64
-	size     int64
-	device   *string
-	buf []byte
+	id        int
+	offset    int64
+	size      int64
+	device    *string
+	buf       []byte
 	readslots slots
-	mu  sync.RWMutex
+	mu        sync.RWMutex
 	// piece state
 	// 0 - incomplete
 	// 1 - complete in memory
 	// 2 - only in linux cache
 	// 3 - Read loopback, cache miss
-	state    atomic.Uint32
+	state atomic.Uint32
 }
 
 // ReadAt reads data from a piece at the specified offset.
@@ -257,18 +256,20 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		log.Println("!!! READ LOOPBACK", p.id)
 		// TODO tell anacrolix we're imcomplete
 		p.state.Store(0) // set incomplete so caller doesn't loop
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 0, p.offset, lo, hi, beforeState, "purple")
 		return 0, syscall.EIO
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	state := p.state.Load()
-	log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, state, p.offset, lo, hi, beforeState)
 	if beforeState > state { // state changed while waiting for lock
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, state, p.offset, lo, hi, beforeState, "violet")
 		log.Println("!!! State change while waiting lock -> redo", p.id)
 		return 0, syscall.EIO
 	}
 	switch state {
 	case 0: // use membuf
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, state, p.offset, lo, hi, beforeState, "green")
 		if p.buf == nil {
 			return 0, syscall.EIO
 		}
@@ -281,10 +282,10 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		p.readslots = p.readslots.merge(lo, hi) // TODO only merge if the call comes from PRead
 		if len(p.readslots) == 1 && p.readslots[0].start == 0 && p.readslots[0].stop == p.size && p.id != 0 { // completly read
 			log.Println("READ COMPLETE", p.id)
-			log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, 2, p.offset, 0, p.size, 2)
 			p.buf = nil // remove buf
 			p.readslots = nil
 			p.state.Store(2)
+			log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 2, p.offset, 0, p.size, 1, "yellow")
 		}
 		return n, nil
 	case 2: // ReadAt from another peer
@@ -293,22 +294,22 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		log.Println("----------------------------------------", p.id)
 		var err error
 		n := 0
-		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, 3, p.offset, lo, hi, 3)
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 3, p.offset, lo, hi, 3, "orange")
 		f, err := os.Open(*p.device)
 		if err != nil {
-			goto cachemiss;
+			goto cachemiss
 		}
 		log.Println("in REadat", p.id)
-		if n, err = f.ReadAt(b, p.offset + off); err != nil {
-			goto cachemiss;
+		if n, err = f.ReadAt(b, p.offset+off); err != nil {
+			goto cachemiss
 		}
-		log.Println("out REadat cache hit!", p.id)
 		p.state.Store(2)
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 2, p.offset, lo, hi, 2, "cyan")
 		return n, nil
 
 		// err != nil -> cache miss
-		cachemiss: // goto label
-		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, 4, p.offset, lo, hi, 4)
+	cachemiss: // goto label
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 0, p.offset, lo, hi, 3, "red")
 		log.Println("@@@Device cache read fail, marking incomplete", p.id)
 		p.buf = make([]byte, p.size, p.size)
 		p.readslots = nil
@@ -455,7 +456,7 @@ func (p *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 		nbdkit.Debug(fmt.Sprint("File ", f.Path(), " ", f.Length()))
 	}
 	return &T0rrentConnection{
-		tsize:  uint64(p.t.Length()),
+		tsize:     uint64(p.t.Length()),
 		readerfun: p.t.NewReader,
 	}, nil
 }
@@ -541,7 +542,7 @@ func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error
 			// 			Errno:  29, // ESPIPE
 			// 		}
 			// 	}
-   //
+			//
 			// 	if n, err = reader.Read(buf[nread:]); err != nil {
 			// 		if err == io.EOF && (offset+uint64(len(buf))) != c.tsize {
 			// 			return err
