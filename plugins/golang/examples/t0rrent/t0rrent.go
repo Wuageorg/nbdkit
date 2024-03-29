@@ -10,10 +10,14 @@ import (
 
 	"fmt"
 	"io"
+	"os"
+	// "errors"
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"syscall"
 
 	"libguestfs.org/nbdkit"
 
@@ -65,10 +69,11 @@ func NewStorage(device string) *StorLinuxCache {
 
 // OpenTorrent opens a torrent for reading.
 func (s *StorLinuxCache) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (ts.TorrentImpl, error) {
+	h := infoHash.AsString()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	torr := NewTorrStor(s, info, infoHash)
-	s.torrs[infoHash.AsString()] = torr
+	torr := NewTorrStor(s, info, infoHash, s.device)
+	s.torrs[h] = torr
 	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush}, nil
 }
 
@@ -115,18 +120,20 @@ type TorrStorLinuxCache struct {
 	hash        metainfo.Hash
 	pieceLength int64
 	isClosed    bool
+	device      string
 
 	mu        sync.RWMutex
 	memPieces []TorrPieceLinuxCache // Pieces that are being downloaded
 }
 
 // // NewTorrStor creates a new TorrStorLinuxCache instance.
-func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Hash) *TorrStorLinuxCache {
+func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Hash, device string) *TorrStorLinuxCache {
 	pcnt := info.NumPieces()
 	return &TorrStorLinuxCache{
 		pieceLength: info.PieceLength,
 		hash:        hash,
 		memPieces:   make([]TorrPieceLinuxCache, pcnt, pcnt),
+		device: device,
 	}
 }
 
@@ -135,12 +142,14 @@ func (t *TorrStorLinuxCache) Piece(m metainfo.Piece) ts.PieceImpl {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	id := m.Index()
-	size := m.Length()
 	p := &t.memPieces[id]
 	if p.size == 0 {
+		size := m.Length()
 		p.id = id
+		p.offset = m.Offset()
 		p.size = size
 		p.buf = make([]byte, size, size)
+		p.device = &t.device
 	}
 	return p
 }
@@ -159,23 +168,77 @@ func (t *TorrStorLinuxCache) Flush() error {
 // TorrPieceLinuxCache represents a piece of a torrent.
 type TorrPieceLinuxCache struct {
 	id       int
+	offset   int64
 	size     int64
-	complete bool
-
+	device   *string
 	buf []byte
+	readsize int64
 	mu  sync.RWMutex
+	// piece state
+	// 0 - incomplete
+	// 1 - complete in memory
+	// 2 - only in linux cache
+	// 3 - Read loopback, cache miss
+	state    atomic.Uint32
 }
 
 // ReadAt reads data from a piece at the specified offset.
 func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(b))
 
+	log.Println("--------------------------- ReadAt Piece ", p.id, p.state.Load(), off, len(b))
+
+	if p.state.Load() > 2 { // before locking the piece, we check the read loopback situation
+		// cache miss
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		log.Println("Device cache read fail, marking incomplete")
+		p.buf = make([]byte, p.size, p.size)
+		p.state.Store(0)
+		p.readsize = 0
+		return 0, syscall.EIO
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// TODO find a way to know if read comes from nbdkit or another torrent client
-	// if nbdkit, and the whole piece has been read and is complete, we can free the buffer and
-	// resolve future readAt with linux cache
-	return copy(b, p.buf[lo:hi:hi]), nil
+	state := p.state.Load()
+	switch state {
+	case 0: // use membuf
+		return copy(b, p.buf[lo:hi:hi]), nil
+	case 1: // not entirely in linux cache
+		n := copy(b, p.buf[lo:hi:hi])
+		if p.readsize == off {
+			p.readsize += int64(len(b))
+		} else {
+			log.Println("-----Out of order read", p.id, p.readsize, off, len(b))
+		}
+		if p.readsize == p.size { // completly read
+			log.Println("++++++++++++++READ COMPLETE", p.id)
+			p.buf = nil // remove buf
+			p.state.Store(2)
+		}
+		return n, nil
+	case 2: // ReadAt from another peer
+		// read in linux cache
+		p.state.Add(1)
+		log.Println("os.Open", p.id, *p.device)
+		f, err := os.Open(*p.device)
+		log.Println("open done", p.id)
+		if err != nil {
+			p.state.Store(0)
+			return 0, err
+		}
+		log.Println("f.ReadAt1", p.id, p.offset + off, len(b))
+		n, err := f.ReadAt(b, p.offset + off)
+		log.Println("fra1 done", p.id)
+		if err != nil {
+			p.state.Store(0)
+			return n, err
+		}
+		p.state.Store(2)
+		return n, nil
+	default:
+		panic(state)
+	}
 }
 
 // WriteAt writes data to a piece at the specified offset.
@@ -188,20 +251,21 @@ func (p *TorrPieceLinuxCache) WriteAt(b []byte, off int64) (int, error) {
 
 // MarkComplete marks a piece as complete.
 func (p *TorrPieceLinuxCache) MarkComplete() error {
-	p.complete = true
+	p.state.Store(1)
 	return nil
 }
 
 // MarkNotComplete marks a piece as not complete.
 func (p *TorrPieceLinuxCache) MarkNotComplete() error {
-	p.complete = false
+	p.state.Store(0)
 	return nil
 }
 
 // Completion returns the completion status of a piece.
 func (p *TorrPieceLinuxCache) Completion() ts.Completion {
+	state := p.state.Load()
 	return ts.Completion{
-		Complete: p.complete,
+		Complete: state > 0,
 		Ok:       true,
 		Err:      nil,
 	}
@@ -311,7 +375,7 @@ func (p *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 	}
 	return &T0rrentConnection{
 		tsize:  uint64(p.t.Length()),
-		reader: p.t.NewReader(), // One reader per connections
+		readerfun: p.t.NewReader,
 	}, nil
 }
 
@@ -326,8 +390,7 @@ func (p *T0rrentPlugin) Unload() {
 type T0rrentConnection struct {
 	nbdkit.Connection // iface
 	tsize             uint64
-	reader            torrent.Reader
-	mu                sync.Mutex
+	readerfun         func() torrent.Reader
 }
 
 // GetSize retrieves the size of the torrent data.
@@ -354,17 +417,14 @@ func (c *T0rrentConnection) PWrite(buf []byte, offset uint64,
 // Close termitates the client connection.
 func (c *T0rrentConnection) Close() {
 	c.tsize = 0
-	if err := c.reader.Close(); err != nil {
-		nbdkit.Debug(err.Error())
-	}
 }
 
 // PRead reads data from the torrent file at the specified offset into the provided buffer.
 func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	reader := c.readerfun()
+	defer reader.Close()
 
-	pos, err := c.reader.Seek(int64(offset), io.SeekStart)
+	pos, err := reader.Seek(int64(offset), io.SeekStart)
 	// ensure the seek operation landed at the correct position
 	switch {
 	case err != nil:
@@ -379,7 +439,7 @@ func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error
 	// loop until the buffer is filled or an error occurs
 	for nread := 0; nread < len(buf); {
 		var n int
-		if n, err = c.reader.Read(buf[nread:]); err != nil {
+		if n, err = reader.Read(buf[nread:]); err != nil {
 			// reader will return a io.EOF when reading the last byte
 			// but we don't want to err out nbdkit if it is indeed the
 			// last block of data
