@@ -191,22 +191,23 @@ func removeIndex(s []int64, index int) []int64 {
 func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(b))
 
-	log.Println("--------------------------- ReadAt Piece ", p.id, p.state.Load(), off, len(b))
+	// if p.state.Load() > 2 {
+	// 	log.Println("--------------------------- ReadAt Piece ", p.id, p.state.Load(), off, len(b))
+	// }
 
-	if p.state.Load() > 2 { // before locking the piece, we check the read loopback situation
+	beforeState := p.state.Load()
+	if beforeState > 2 { // before locking the piece, we check the read loopback situation
 		// cache miss
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		log.Println("Device cache read fail, marking incomplete", p.id)
-		p.buf = make([]byte, p.size, p.size)
-		p.state.Store(0)
-		p.readrangesizes = nil
-		p.readrangeoffsets = nil
+		log.Println("!!! READ LOOPBACK", p.id)
 		return 0, syscall.EIO
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	state := p.state.Load()
+	if beforeState > state { // state changed while waiting for lock
+		log.Println("!!! State change -> redo", p.id)
+		return 0, syscall.EIO
+	}
 	switch state {
 	case 0: // use membuf
 		return copy(b, p.buf[lo:hi:hi]), nil
@@ -245,23 +246,28 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	case 2: // ReadAt from another peer
 		// read in linux cache
 		p.state.Add(1)
-		log.Println("os.Open", p.id, *p.device)
-		f, err := os.Open(*p.device)
-		log.Println("open done", p.id)
-		if err != nil {
-			p.state.Store(0)
-			return 0, err
-		}
+		var err error
+		n := 0
 		log.Println("f.ReadAt1", p.id, p.offset + off, len(b))
-		n, err := f.ReadAt(b, p.offset + off)
-		log.Println("fra1 done", p.id)
+		f, err := os.Open(*p.device)
 		if err != nil {
-			p.state.Store(0)
-			return n, err
+			goto cachemiss;
+		}
+		if n, err = f.ReadAt(b, p.offset + off); err != nil {
+			goto cachemiss;
 		}
 		log.Println("||||||||f.ReadAt1 Success from cache", p.id, p.offset + off, len(b))
 		p.state.Store(2)
 		return n, nil
+
+		// err != nil -> cache miss
+		cachemiss: // goto label
+		log.Println("@@@Device cache read fail, marking incomplete", p.id)
+		p.buf = make([]byte, p.size, p.size)
+		p.readrangesizes = nil
+		p.readrangeoffsets = nil
+		p.state.Store(0)
+		return n, err
 	default:
 		panic(state)
 	}
@@ -471,6 +477,15 @@ func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error
 			// last block of data
 			if err == io.EOF && (offset+uint64(len(buf))) != c.tsize {
 				return err
+			}
+			// On cache miss we get syscall.EIO but we still want to
+			// honor the PRead so try to read a second time
+			if err == syscall.EIO {
+				if n, err = reader.Read(buf[nread:]); err != nil {
+					if err == io.EOF && (offset+uint64(len(buf))) != c.tsize {
+						return err
+					}
+				}
 			}
 		}
 		nread += n
