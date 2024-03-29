@@ -8,8 +8,11 @@ import (
 	// Standard library imports
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	// Third-party package imports
@@ -21,6 +24,7 @@ import (
 )
 
 var pluginName = "t0rrent"
+var nbdDevice string
 
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
 // 🎛️🎛️🎛️🎛️🎛️🎛️🎛️🎛️
@@ -32,7 +36,6 @@ var pluginName = "t0rrent"
 type T0rrentPlugin struct {
 	nbdkit.Plugin                  // NBD plugin interface
 	magnet        string           // Magnet link for the torrent
-	device        string           // NBD device path
 	client        *torrent.Client  // Torrent client
 	torrent       *torrent.Torrent // Torrent object
 }
@@ -46,7 +49,7 @@ func (tp *T0rrentPlugin) Config(key string, value string) error {
 			tp.magnet = fmt.Sprintf("magnet:?xt=urn:btih:%s", value)
 		}
 	case "device":
-		tp.device = value
+		nbdDevice = value
 	default:
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("unknown parameter %s", key)}
 	}
@@ -59,7 +62,7 @@ func (tp *T0rrentPlugin) ConfigComplete() error {
 	switch {
 	case len(tp.magnet) == 0:
 		return nbdkit.PluginError{Errmsg: "magnet parameter is required"}
-	case len(tp.device) == 0:
+	case len(nbdDevice) == 0:
 		return nbdkit.PluginError{Errmsg: "device parameter is required"}
 	}
 	return nil
@@ -74,7 +77,7 @@ func (tp *T0rrentPlugin) GetReady() error {
 	conf.DisableIPv4 = false
 	conf.DisableTCP = true
 	conf.DisableUTP = false
-	conf.DefaultStorage = NewRAMStorage(tp.device)
+	conf.DefaultStorage = NewRAMStorage()
 	//conf.Debug = true
 
 	var err error
@@ -88,16 +91,6 @@ func (tp *T0rrentPlugin) GetReady() error {
 	}
 
 	tp.torrent.SetDisplayName("Downloading torrent metadata")
-	// p.t.PieceState()
-	// func (t *Torrent) AddWebSeeds(urls []string, opts ...AddWebSeedsOpt)
-	// func (t *Torrent) AddTrackers(announceList [][]string)
-	// func (t *Torrent) AddPeers(pp []PeerInfo) (n int)
-	// func (t *Torrent) CancelPieces(begin, end pieceIndex)
-	// func (t *Torrent) DownloadPieces(begin, end pieceIndex)
-	// func (t *Torrent) Length() int64
-	// func (t *Torrent) NumPieces() pieceIndex
-	// func (t *Torrent) Piece(i pieceIndex) *Piece
-	// func (t *Torrent) SubscribePieceStateChanges() *pubsub.Subscription[PieceStateChange]
 
 	select {
 	case <-tp.torrent.GotInfo():
@@ -126,7 +119,7 @@ func (tp *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error)
 
 	// TODO wait for GoTInfo here
 	return &T0rrentConnection{
-		size:   uint64(tp.torrent.Info().TotalLength()),
+		size:   tp.torrent.Info().TotalLength(),
 		reader: tp.torrent.NewReader,
 	}, nil
 }
@@ -141,13 +134,13 @@ func (tp *T0rrentPlugin) Unload() {
 // T0rrentConnection represents a client connection for serving torrent data.
 type T0rrentConnection struct {
 	nbdkit.Connection // connection interface
-	size              uint64
+	size              int64
 	reader            func() torrent.Reader
 }
 
 // GetSize retrieves the size of the torrent data.
 func (tc *T0rrentConnection) GetSize() (uint64, error) {
-	return tc.size, nil
+	return uint64(tc.size), nil
 }
 
 // Clients are allowed to make multiple connections safely.
@@ -189,19 +182,22 @@ func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) erro
 	// ignore flags
 	_ = flags
 
+	// convert offset once
+	off := int64(offset)
+
 	// acquire a torrent file reader
 	torrent := tc.reader()
 	defer torrent.Close()
 
 	// seek to the specified offset in the torrent file
-	pos, err := torrent.Seek(int64(offset), io.SeekStart)
+	pos, err := torrent.Seek(off, io.SeekStart)
 
 	// ensure the seek operation landed at the correct position
 	switch {
 	case err != nil:
 		// seeking raised an error
 		return err
-	case pos != int64(offset):
+	case pos != off:
 		// seeking failed to reach the expected position
 		return nbdkit.PluginError{
 			Errmsg: fmt.Sprintf("Seek failed got: %x expected: %x", pos, offset),
@@ -212,13 +208,25 @@ func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) erro
 	// loop until the buffer is filled or an error occurs
 	for nread := 0; nread < len(buf); {
 		// read data into the buffer from the torrent file
-		if n, err := torrent.Read(buf[nread:]); err != nil {
-			// read error
-			return err
-		} else {
-			// update the number of bytes read
+		n, err := torrent.Read(buf[nread:])
+		switch err {
+		case nil:
+			// nothing to do
+		case syscall.EAGAIN:
+			// prepare retry
 			nread += n
+			offset += uint64(nread)
+
+			// retry read
+			return tc.PRead(buf[nread:], offset, flags)
+		default:
+			// filter EOF on last block and raise
+			if err != io.EOF || off+int64(len(buf)) != tc.size {
+				return err
+			}
 		}
+		// update read count
+		nread += n
 	}
 	return nil
 }
@@ -250,14 +258,12 @@ const TIMEOUT = 10
 // RAMStorage represents an in-memory storage implementation for torrents.
 type RAMStorage struct {
 	storage.ClientImpl
-	device  string // "/dev/nbd0"
 	torrent *RAMTorrent
 }
 
 // NewRAMStorage creates a new RAMStorage instance.
-func NewRAMStorage(dev string) (rs *RAMStorage) {
+func NewRAMStorage() (rs *RAMStorage) {
 	rs = new(RAMStorage)
-	rs.device = dev
 	return
 }
 
@@ -276,8 +282,6 @@ func (rs *RAMStorage) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (
 // RAMTorrent represents a torrent stored in memory.
 type RAMTorrent struct {
 	storage.TorrentImpl
-	sync.RWMutex
-
 	pieces []RAMPiece // Pieces that are being downloaded
 }
 
@@ -287,11 +291,12 @@ func NewRAMTorrent(mi *metainfo.Info) *RAMTorrent {
 
 	// preallocate pieces storage
 	pieces := make([]RAMPiece, mi.NumPieces())
-	last := len(pieces) - 1
+	base, last := int64(0), len(pieces)-1
 	for i := range pieces[:last] {
-		pieces[i].data = make([]byte, plen)
+		pieces[i].mkpiece(base, plen)
+		base += plen
 	}
-	pieces[last].data = make([]byte, tlen%plen)
+	pieces[last].mkpiece(base, tlen%plen)
 
 	return &RAMTorrent{
 		pieces: pieces,
@@ -318,24 +323,99 @@ func (rt *RAMTorrent) Flush() error {
 	return nil
 }
 
+type RAMPieceState uint32
+
+const (
+	PARTIAL RAMPieceState = iota
+	COMPLETE
+	CACHED
+	INVALID
+)
+
 // RAMPiece represents a piece of a torrent stored in memory.
 type RAMPiece struct {
 	storage.PieceImpl
-	sync.RWMutex
-	done bool
-	data []byte
+	sync.Mutex
+	stat   atomic.Uint32
+	base   int64
+	size   int64
+	data   []byte
+	cached slots
+}
+
+func (rp *RAMPiece) mkpiece(base int64, size int64) {
+	rp.base = base
+	rp.size = size
+
+	rp.data = make([]byte, size)
+	rp.cached = make(slots, 0)
+
+	rp.stat.Store(uint32(PARTIAL))
+}
+
+func (rp *RAMPiece) mkcached() {
+	rp.data = nil
+	rp.cached = nil
+
+	rp.stat.Store(uint32(CACHED))
 }
 
 // ReadAt reads data from a piece at the specified offset.
 func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(buf))
 
-	// TODO if complete, check if in linux cache
+	// prevent read loop
+	stat0 := RAMPieceState(rp.stat.Load())
+	if stat0 == INVALID {
+		return 0, syscall.EIO
+	}
 
-	rp.RLock()
-	defer rp.RUnlock()
+	rp.Lock()
+	defer rp.Unlock()
 
-	return copy(buf, rp.data[lo:hi:hi]), nil
+	stat1 := RAMPieceState(rp.stat.Load())
+	if stat1 < stat0 {
+		// the piece has been deprecated while waiting for it
+		return 0, syscall.EAGAIN
+	}
+
+	switch stat1 {
+	case PARTIAL:
+		return copy(buf, rp.data[lo:hi:hi]), nil
+	case COMPLETE:
+		nelem := copy(buf, rp.data[lo:hi:hi])
+		rp.cached = rp.cached.merge(off, len(buf))
+
+		all := slot{0, int64(len(rp.data) - 1)}
+		if len(rp.cached) == 1 && rp.cached[0] == all {
+			// free storage and mark cached
+			rp.mkcached()
+		}
+
+		return nelem, nil
+	case CACHED:
+		var (
+			err   error
+			dev   *os.File
+			nelem int
+		)
+
+		if dev, err = os.Open(nbdDevice); err != nil {
+			return 0, syscall.EIO
+		}
+
+		rp.stat.Store(uint32(INVALID))
+		if nelem, err = dev.ReadAt(buf, rp.base+off); err != nil {
+			// cache miss, prepare anew for a retry
+			rp.mkpiece(rp.base, rp.size)
+			return 0, syscall.EAGAIN
+		}
+		rp.stat.Store(uint32(CACHED))
+
+		return nelem, nil
+	}
+
+	panic("unreachable")
 }
 
 // WriteAt writes data to a piece at the specified offset.
@@ -350,29 +430,93 @@ func (rp *RAMPiece) WriteAt(buf []byte, off int64) (int, error) {
 
 // MarkComplete marks a piece as complete.
 func (rp *RAMPiece) MarkComplete() error {
-	rp.done = true
+	rp.stat.Store(uint32(COMPLETE))
 	return nil
 }
 
 // MarkNotComplete marks a piece as not complete.
 func (rp *RAMPiece) MarkNotComplete() error {
-	rp.done = false
+	rp.stat.Store(uint32(PARTIAL))
 	return nil
 }
 
 // Completion returns the completion status of a piece.
 func (rp *RAMPiece) Completion() storage.Completion {
 	return storage.Completion{
-		Complete: rp.done,
+		Complete: rp.stat.Load() >= uint32(COMPLETE),
 		Ok:       true,
 		Err:      nil,
 	}
 }
 
-// Void resets the RAMPiece, marking it as not complete and voiding its data.
+// Void resets the RAMPiece, marking it as missing and voiding its data.
 func (rp *RAMPiece) Void() {
-	rp.done = false
+	rp.stat.Store(uint32(PARTIAL))
 	rp.data = nil
+}
+
+type slot struct {
+	start, stop int64
+}
+
+type slots []slot
+
+func (L slots) merge(off int64, size int) slots {
+	min := func(a, b int64) int64 {
+		if a < b {
+			return a
+		}
+		return b
+	}
+
+	max := func(a, b int64) int64 {
+		if a > b {
+			return a
+		}
+		return b
+	}
+
+	R := slots{{off, off + int64(size)}}
+	if len(L) == 0 {
+		return R
+	}
+
+	merged := make(slots, 0)
+
+	il, ir := 0, 0
+	for il < len(L) && ir < len(R) {
+		l, r := L[il], R[ir]
+		overlapLR := (r.start >= l.start) && (r.start <= l.stop)
+		overlapRL := (l.start >= r.start) && (l.start <= r.stop)
+
+		if overlapLR || overlapRL {
+			merged := slot{
+				start: min(l.start, r.start),
+				stop:  max(l.stop, r.stop),
+			}
+			if l.stop < r.stop {
+				R[ir] = merged
+				il++
+			} else {
+				L[il] = merged
+				ir++
+			}
+			continue
+		}
+
+		if l.stop < r.stop {
+			merged = append(merged, l)
+			il++
+		} else {
+			merged = append(merged, r)
+			ir++
+		}
+	}
+
+	merged = append(merged, L[il:]...)
+	merged = append(merged, R[ir:]...)
+
+	return merged
 }
 
 //----------------------------------------------------------------------
