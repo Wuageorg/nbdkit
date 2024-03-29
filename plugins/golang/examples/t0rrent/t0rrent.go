@@ -172,7 +172,8 @@ type TorrPieceLinuxCache struct {
 	size     int64
 	device   *string
 	buf []byte
-	readsize int64
+	readrangeoffsets []int64
+	readrangesizes []int64
 	mu  sync.RWMutex
 	// piece state
 	// 0 - incomplete
@@ -180,6 +181,10 @@ type TorrPieceLinuxCache struct {
 	// 2 - only in linux cache
 	// 3 - Read loopback, cache miss
 	state    atomic.Uint32
+}
+
+func removeIndex(s []int64, index int) []int64 {
+    return append(s[:index], s[index+1:]...)
 }
 
 // ReadAt reads data from a piece at the specified offset.
@@ -192,10 +197,11 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		// cache miss
 		p.mu.Lock()
 		defer p.mu.Unlock()
-		log.Println("Device cache read fail, marking incomplete")
+		log.Println("Device cache read fail, marking incomplete", p.id)
 		p.buf = make([]byte, p.size, p.size)
 		p.state.Store(0)
-		p.readsize = 0
+		p.readrangesizes = nil
+		p.readrangeoffsets = nil
 		return 0, syscall.EIO
 	}
 	p.mu.Lock()
@@ -206,14 +212,33 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		return copy(b, p.buf[lo:hi:hi]), nil
 	case 1: // not entirely in linux cache
 		n := copy(b, p.buf[lo:hi:hi])
-		if p.readsize == off {
-			p.readsize += int64(len(b))
-		} else {
-			log.Println("-----Out of order read", p.id, p.readsize, off, len(b))
+		if p.readrangeoffsets == nil {
+			p.readrangeoffsets = make([]int64, 0)
+			p.readrangesizes = make([]int64, 0)
 		}
-		if p.readsize == p.size { // completly read
+		p.readrangeoffsets = append(p.readrangeoffsets, off)
+		p.readrangesizes = append(p.readrangesizes, int64(len(b)))
+		removeidx := make([]int, 0)
+		for do := true; do; do = len(removeidx) > 0 {
+			for i := 0; i < len(p.readrangeoffsets); i++ { // merge ranges
+				for j := 0; j < i; j++ {
+					if p.readrangeoffsets[i] + p.readrangesizes[i] == p.readrangeoffsets[j] {
+						removeidx = append(removeidx, j)
+						p.readrangesizes[i] += p.readrangesizes[j]
+					}
+				}
+			}
+			for i := len(removeidx) - 1; i >= 0; i-- {
+				p.readrangesizes = removeIndex(p.readrangesizes, removeidx[i])
+				p.readrangeoffsets = removeIndex(p.readrangeoffsets, removeidx[i])
+			}
+			removeidx = removeidx[:0]
+		}
+		if len(p.readrangesizes) == 1 && len(p.readrangeoffsets) == 1 && p.readrangeoffsets[0] == 0 && p.readrangesizes[0] == p.size { // completly read
 			log.Println("++++++++++++++READ COMPLETE", p.id)
 			p.buf = nil // remove buf
+			p.readrangeoffsets = nil
+			p.readrangesizes = nil
 			p.state.Store(2)
 		}
 		return n, nil
@@ -234,6 +259,7 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 			p.state.Store(0)
 			return n, err
 		}
+		log.Println("||||||||f.ReadAt1 Success from cache", p.id, p.offset + off, len(b))
 		p.state.Store(2)
 		return n, nil
 	default:
