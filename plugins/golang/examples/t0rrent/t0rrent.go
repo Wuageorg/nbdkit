@@ -165,6 +165,71 @@ func (t *TorrStorLinuxCache) Flush() error {
 	return nil
 }
 
+
+type slot struct {
+	start, stop int64
+}
+
+type slots []slot
+
+func (ss slots) merge(lo int64, hi int64) slots {
+	min := func(a, b int64) int64 {
+		if a < b {
+			return a
+		}
+		return b
+	}
+
+	max := func(a, b int64) int64 {
+		if a > b {
+			return a
+		}
+		return b
+	}
+
+	xs := slots{{lo, hi}}
+	if len(ss) == 0 {
+		return xs
+	}
+
+	merged := make(slots, 0)
+
+	is, ix := 0, 0
+	for is < len(ss) && ix < len(xs) {
+		vs, vx := ss[is], xs[ix]
+		overlap12 := (vx.start >= vs.start) && (vx.start <= vs.stop)
+		overlap21 := (vs.start >= vx.start) && (vs.start <= vx.stop)
+
+		if overlap12 || overlap21 {
+			merged := slot{
+				start: min(vs.start, vx.start),
+				stop:  max(vs.stop, vx.stop),
+			}
+			if vs.stop < vx.stop {
+				xs[ix] = merged
+				is++
+			} else {
+				ss[is] = merged
+				ix++
+			}
+			continue
+		}
+
+		if vs.stop < vx.stop {
+			merged = append(merged, vs)
+			is++
+		} else {
+			merged = append(merged, vx)
+			ix++
+		}
+	}
+
+	merged = append(merged, ss[is:]...)
+	merged = append(merged, xs[ix:]...)
+
+	return merged
+}
+
 // TorrPieceLinuxCache represents a piece of a torrent.
 type TorrPieceLinuxCache struct {
 	id       int
@@ -172,8 +237,7 @@ type TorrPieceLinuxCache struct {
 	size     int64
 	device   *string
 	buf []byte
-	readrangeoffsets []int64
-	readrangesizes []int64
+	readslots slots
 	mu  sync.RWMutex
 	// piece state
 	// 0 - incomplete
@@ -181,10 +245,6 @@ type TorrPieceLinuxCache struct {
 	// 2 - only in linux cache
 	// 3 - Read loopback, cache miss
 	state    atomic.Uint32
-}
-
-func removeIndex(s []int64, index int) []int64 {
-    return append(s[:index], s[index+1:]...)
 }
 
 // ReadAt reads data from a piece at the specified offset.
@@ -199,13 +259,15 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	if beforeState > 2 { // before locking the piece, we check the read loopback situation
 		// cache miss
 		log.Println("!!! READ LOOPBACK", p.id)
+		p.state.Store(0) // set incomplete so caller doesn't loop
 		return 0, syscall.EIO
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	state := p.state.Load()
+	log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, state, p.offset, lo, hi, beforeState)
 	if beforeState > state { // state changed while waiting for lock
-		log.Println("!!! State change -> redo", p.id)
+		log.Println("!!! State change while waiting lock -> redo", p.id)
 		return 0, syscall.EIO
 	}
 	switch state {
@@ -213,42 +275,24 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		return copy(b, p.buf[lo:hi:hi]), nil
 	case 1: // not entirely in linux cache
 		n := copy(b, p.buf[lo:hi:hi])
-		if p.readrangeoffsets == nil {
-			p.readrangeoffsets = make([]int64, 0)
-			p.readrangesizes = make([]int64, 0)
+		if p.readslots == nil {
+			p.readslots = slots{}
 		}
-		p.readrangeoffsets = append(p.readrangeoffsets, off)
-		p.readrangesizes = append(p.readrangesizes, int64(len(b)))
-		removeidx := make([]int, 0)
-		for do := true; do; do = len(removeidx) > 0 {
-			for i := 0; i < len(p.readrangeoffsets); i++ { // merge ranges
-				for j := 0; j < i; j++ {
-					if p.readrangeoffsets[i] + p.readrangesizes[i] == p.readrangeoffsets[j] {
-						removeidx = append(removeidx, j)
-						p.readrangesizes[i] += p.readrangesizes[j]
-					}
-				}
-			}
-			for i := len(removeidx) - 1; i >= 0; i-- {
-				p.readrangesizes = removeIndex(p.readrangesizes, removeidx[i])
-				p.readrangeoffsets = removeIndex(p.readrangeoffsets, removeidx[i])
-			}
-			removeidx = removeidx[:0]
-		}
-		if len(p.readrangesizes) == 1 && len(p.readrangeoffsets) == 1 && p.readrangeoffsets[0] == 0 && p.readrangesizes[0] == p.size { // completly read
-			log.Println("++++++++++++++READ COMPLETE", p.id)
+		p.readslots = p.readslots.merge(lo, hi) // TODO only merge if the call comes from PRead
+		// log.Println(p.readslots)
+		if len(p.readslots) == 1 && p.readslots[0].start == 0 && p.readslots[0].stop == p.size { // completly read
+			log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, 2, p.offset, 0, p.size, 2)
 			p.buf = nil // remove buf
-			p.readrangeoffsets = nil
-			p.readrangesizes = nil
+			p.readslots = nil
 			p.state.Store(2)
 		}
 		return n, nil
 	case 2: // ReadAt from another peer
 		// read in linux cache
-		p.state.Add(1)
+		p.state.Store(3)
 		var err error
 		n := 0
-		log.Println("f.ReadAt1", p.id, p.offset + off, len(b))
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, 3, p.offset, lo, hi, 3)
 		f, err := os.Open(*p.device)
 		if err != nil {
 			goto cachemiss;
@@ -256,16 +300,15 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		if n, err = f.ReadAt(b, p.offset + off); err != nil {
 			goto cachemiss;
 		}
-		log.Println("||||||||f.ReadAt1 Success from cache", p.id, p.offset + off, len(b))
 		p.state.Store(2)
 		return n, nil
 
 		// err != nil -> cache miss
 		cachemiss: // goto label
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d\n", p.id, 4, p.offset, lo, hi, 4)
 		log.Println("@@@Device cache read fail, marking incomplete", p.id)
 		p.buf = make([]byte, p.size, p.size)
-		p.readrangesizes = nil
-		p.readrangeoffsets = nil
+		p.readslots = nil
 		p.state.Store(0)
 		return n, err
 	default:
@@ -481,6 +524,18 @@ func (c *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) error
 			// On cache miss we get syscall.EIO but we still want to
 			// honor the PRead so try to read a second time
 			if err == syscall.EIO {
+				pos, err := reader.Seek(int64(offset) + int64(nread), io.SeekStart)
+				// ensure the seek operation landed at the correct position
+				switch {
+				case err != nil:
+					return err
+				case pos != int64(offset):
+					return nbdkit.PluginError{
+						Errmsg: "Seek failed",
+						Errno:  29, // ESPIPE
+					}
+				}
+
 				if n, err = reader.Read(buf[nread:]); err != nil {
 					if err == io.EOF && (offset+uint64(len(buf))) != c.tsize {
 						return err
