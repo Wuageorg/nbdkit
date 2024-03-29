@@ -45,7 +45,7 @@ func (tp *T0rrentPlugin) Config(key string, value string) error {
 		if !strings.HasPrefix(value, "magnet:") {
 			tp.magnet = fmt.Sprintf("magnet:?xt=urn:btih:%s", value)
 		}
-	case "nbdmount":
+	case "device":
 		tp.device = value
 	default:
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("unknown parameter %s", key)}
@@ -60,7 +60,7 @@ func (tp *T0rrentPlugin) ConfigComplete() error {
 	case len(tp.magnet) == 0:
 		return nbdkit.PluginError{Errmsg: "magnet parameter is required"}
 	case len(tp.device) == 0:
-		return nbdkit.PluginError{Errmsg: "nbdmount parameter is required"}
+		return nbdkit.PluginError{Errmsg: "device parameter is required"}
 	}
 	return nil
 }
@@ -75,7 +75,7 @@ func (tp *T0rrentPlugin) GetReady() error {
 	conf.DisableTCP = true
 	conf.DisableUTP = false
 	conf.DefaultStorage = NewRAMStorage(tp.device)
-	conf.Debug = true
+	//conf.Debug = true
 
 	var err error
 
@@ -101,7 +101,7 @@ func (tp *T0rrentPlugin) GetReady() error {
 
 	select {
 	case <-tp.torrent.GotInfo():
-		nbdkit.Debug(fmt.Sprint("Got torrent %s infos", tp.torrent.InfoHash()))
+		nbdkit.Debug(fmt.Sprintf("Got torrent %s infos", tp.torrent.InfoHash()))
 	case <-time.After(TIMEOUT * time.Second):
 		return fmt.Errorf("Did not got torrent %s infos in %d seconds", tp.torrent.InfoHash(), TIMEOUT)
 	}
@@ -121,6 +121,9 @@ func (tp *T0rrentPlugin) GetReady() error {
 
 // Open prepares the plugin for serving a client connection.
 func (tp *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
+	// ignore readonly
+	_ = readonly
+
 	// TODO wait for GoTInfo here
 	return &T0rrentConnection{
 		size:   uint64(tp.torrent.Info().TotalLength()),
@@ -152,24 +155,27 @@ func (tc *T0rrentConnection) CanMultiConn() (bool, error) {
 	return true, nil
 }
 
+// cannot returns false, nil
+var cannot = func() (b bool, err error) { return }
+
 // Clients are NOT allowed to flush.
 func (tc *T0rrentConnection) CanFlush() (bool, error) {
-	return false, nil
+	return cannot()
 }
 
 // Clients are NOT allowed to trim.
 func (tc *T0rrentConnection) CanTrim() (bool, error) {
-	return false, nil
+	return cannot()
 }
 
 // Clients are NOT allowed to write.
 func (tc *T0rrentConnection) CanWrite() (bool, error) {
-	return false, nil
+	return cannot()
 }
 
 // Clients are NOT allowed to zero.
 func (tc *T0rrentConnection) CanZero() (bool, error) {
-	return false, nil
+	return cannot()
 }
 
 // Close termitates the client connection.
@@ -239,7 +245,7 @@ func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) erro
 // 💾💾💾💾💾💾💾💾
 // 💾💾💾💾💾💾💾💾
 
-const TIMEOUT = 300
+const TIMEOUT = 10
 
 // RAMStorage represents an in-memory storage implementation for torrents.
 type RAMStorage struct {
@@ -249,9 +255,9 @@ type RAMStorage struct {
 }
 
 // NewRAMStorage creates a new RAMStorage instance.
-func NewRAMStorage(nbdmount string) (rs *RAMStorage) {
+func NewRAMStorage(dev string) (rs *RAMStorage) {
 	rs = new(RAMStorage)
-	rs.device = nbdmount
+	rs.device = dev
 	return
 }
 
