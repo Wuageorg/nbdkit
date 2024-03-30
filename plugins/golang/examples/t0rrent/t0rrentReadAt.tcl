@@ -92,7 +92,13 @@ while {[gets stdin line] != -1} {
         set lo_mapped [expr {int(($lo / $piece_length) * ($square_inside_sz * $square_inside_sz))}]
         set hi_mapped [expr {int(($hi / $piece_length) * ($square_inside_sz * $square_inside_sz))}]
 
-        # Draw the rectangle within the square
+        # Draw edge pixels of square
+        .c create rectangle $rect_x1 [expr {$rect_y1 - 1}] $rect_x2 [expr {$rect_y1 - 1}] -fill $fill_color -outline ""
+        .c create rectangle $rect_x1 [expr {$rect_y2 + 1}] $rect_x2 [expr {$rect_y2 + 1}] -fill $fill_color -outline ""
+        .c create rectangle [expr {$rect_x1 - 1}] $rect_y1 [expr {$rect_x1 - 1}] $rect_y2 -fill $fill_color -outline ""
+        .c create rectangle [expr {$rect_x2 + 1}] $rect_y1 [expr {$rect_x2 + 1}] $rect_y2 -fill $fill_color -outline ""
+
+        # Draw the pixels within the square
         for {set y $rect_y1} {$y <= $rect_y2} {incr y} {
             set rect_start_x $rect_x1
             set rect_end_x $rect_x2
