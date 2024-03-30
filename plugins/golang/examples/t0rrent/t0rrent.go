@@ -42,6 +42,7 @@ type T0rrentPlugin struct {
 
 // Config processes the plugin configuration parameters.
 func (tp *T0rrentPlugin) Config(key string, value string) error {
+
 	switch key {
 	case "magnet":
 		tp.magnet = value
@@ -59,17 +60,20 @@ func (tp *T0rrentPlugin) Config(key string, value string) error {
 
 // ConfigComplete checks if the plugin configuration is complete.
 func (tp *T0rrentPlugin) ConfigComplete() error {
+
 	switch {
 	case len(tp.magnet) == 0:
 		return nbdkit.PluginError{Errmsg: "magnet parameter is required"}
 	case len(nbdDevice) == 0:
 		return nbdkit.PluginError{Errmsg: "device parameter is required"}
 	}
+
 	return nil
 }
 
 // GetReady prepares the plugin for serving torrent data.
 func (tp *T0rrentPlugin) GetReady() error {
+
 	conf := torrent.NewDefaultClientConfig()
 	conf.Seed = true
 	conf.AcceptPeerConnections = true
@@ -199,9 +203,15 @@ func (tc *T0rrentConnection) PRead(buf []byte, offset uint64, flags uint32) erro
 		return err
 	case pos != off:
 		// seeking failed to reach the expected position
+
+		// there is not a clear errno for this case but in the seek() family, the
+		// nearest seems to be EFAULT/"Problem with copying results to user space."
+		// see https://man7.org/linux/man-pages/man2/llseek.2.html
+
+		// abort!
 		return nbdkit.PluginError{
 			Errmsg: fmt.Sprintf("Seek failed got: %x expected: %x", pos, offset),
-			Errno:  29, // ESPIPE
+			Errno:  syscall.EFAULT,
 		}
 	}
 
@@ -289,14 +299,14 @@ type RAMTorrent struct {
 func NewRAMTorrent(mi *metainfo.Info) *RAMTorrent {
 	tlen, plen := mi.TotalLength(), mi.PieceLength
 
-	// preallocate pieces storage
+	// preallocate piece storage
 	pieces := make([]RAMPiece, mi.NumPieces())
 	base, last := int64(0), len(pieces)-1
 	for i := range pieces[:last] {
-		pieces[i].mkpiece(base, plen)
+		pieces[i].mkpartial(base, plen)
 		base += plen
 	}
-	pieces[last].mkpiece(base, tlen%plen)
+	pieces[last].mkpartial(base, tlen%plen)
 
 	return &RAMTorrent{
 		pieces: pieces,
@@ -323,10 +333,8 @@ func (rt *RAMTorrent) Flush() error {
 	return nil
 }
 
-type RAMPieceState uint32
-
 const (
-	PARTIAL RAMPieceState = iota
+	PARTIAL uint32 = iota
 	COMPLETE
 	CACHED
 	INVALID
@@ -343,21 +351,21 @@ type RAMPiece struct {
 	cached slots
 }
 
-func (rp *RAMPiece) mkpiece(base int64, size int64) {
+func (rp *RAMPiece) mkpartial(base int64, size int64) {
 	rp.base = base
 	rp.size = size
 
 	rp.data = make([]byte, size)
 	rp.cached = make(slots, 0)
 
-	rp.stat.Store(uint32(PARTIAL))
+	rp.stat.Store(PARTIAL)
 }
 
 func (rp *RAMPiece) mkcached() {
 	rp.data = nil
 	rp.cached = nil
 
-	rp.stat.Store(uint32(CACHED))
+	rp.stat.Store(CACHED)
 }
 
 // ReadAt reads data from a piece at the specified offset.
@@ -365,7 +373,7 @@ func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
 	lo, hi := off, off+int64(len(buf))
 
 	// prevent read loop
-	stat0 := RAMPieceState(rp.stat.Load())
+	stat0 := rp.stat.Load()
 	if stat0 == INVALID {
 		return 0, syscall.EIO
 	}
@@ -373,7 +381,7 @@ func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
 	rp.Lock()
 	defer rp.Unlock()
 
-	stat1 := RAMPieceState(rp.stat.Load())
+	stat1 := rp.stat.Load()
 	if stat1 < stat0 {
 		// the piece has been deprecated while waiting for it
 		return 0, syscall.EAGAIN
@@ -404,14 +412,16 @@ func (rp *RAMPiece) ReadAt(buf []byte, off int64) (int, error) {
 			return 0, syscall.EIO
 		}
 
-		rp.stat.Store(uint32(INVALID))
+		// prevent read loop
+		rp.stat.Store(INVALID)
 		if nelem, err = dev.ReadAt(buf, rp.base+off); err != nil {
 			// cache miss, prepare anew for a retry
-			rp.mkpiece(rp.base, rp.size)
+			rp.mkpartial(rp.base, rp.size)
 			return 0, syscall.EAGAIN
 		}
-		rp.stat.Store(uint32(CACHED))
 
+		// hit!
+		rp.stat.Store(CACHED)
 		return nelem, nil
 	}
 
@@ -430,20 +440,20 @@ func (rp *RAMPiece) WriteAt(buf []byte, off int64) (int, error) {
 
 // MarkComplete marks a piece as complete.
 func (rp *RAMPiece) MarkComplete() error {
-	rp.stat.Store(uint32(COMPLETE))
+	rp.stat.Store(COMPLETE)
 	return nil
 }
 
 // MarkNotComplete marks a piece as not complete.
 func (rp *RAMPiece) MarkNotComplete() error {
-	rp.stat.Store(uint32(PARTIAL))
+	rp.stat.Store(PARTIAL)
 	return nil
 }
 
 // Completion returns the completion status of a piece.
 func (rp *RAMPiece) Completion() storage.Completion {
 	return storage.Completion{
-		Complete: rp.stat.Load() >= uint32(COMPLETE),
+		Complete: rp.stat.Load() >= COMPLETE,
 		Ok:       true,
 		Err:      nil,
 	}
@@ -451,8 +461,9 @@ func (rp *RAMPiece) Completion() storage.Completion {
 
 // Void resets the RAMPiece, marking it as missing and voiding its data.
 func (rp *RAMPiece) Void() {
-	rp.stat.Store(uint32(PARTIAL))
 	rp.data = nil
+	rp.cached = nil
+	rp.stat.Store(PARTIAL)
 }
 
 type slot struct {
