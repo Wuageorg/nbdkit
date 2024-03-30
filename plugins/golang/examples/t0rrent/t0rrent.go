@@ -287,7 +287,8 @@ type TorrPieceLinuxCache struct {
 	// 0 - incomplete
 	// 1 - complete in memory
 	// 2 - only in linux cache
-	// 3 - Read loopback, cache miss
+	// 3 - Might Read loopback
+	// 4 - confirmed cache miss
 	state atomic.Uint32
 }
 
@@ -308,10 +309,10 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		// cache miss
 		p.torrent.mu.Lock()
 		defer p.torrent.mu.Unlock()
-		p.state.Store(0) // set incomplete so caller doesn't loop
+		p.state.Store(4) // set incomplete so caller doesn't loop
 		p.torrent.piecesToThrash[p.id] = true
-		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 0, p.offset, lo, hi, beforeState, "purple")
-		return 0, reterr()
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 4, p.offset, lo, hi, beforeState, "purple")
+		return 0, syscall.EIO
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -348,19 +349,18 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		p.state.Store(3)
 		var err error
 		n := 0
-		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 3, p.offset, lo, hi, 3, "teal")
+		// don't even try ReadAt if isPread
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 3, p.offset, lo, hi, 3, map[bool]string{true: "teal", false: "orange"} [isPread])
 		f, err := os.Open(*p.device)
 		if err != nil {
 			goto cachemiss
 		}
 		defer f.Close()
-		if n, err = f.ReadAt(b, p.offset+off); err != nil {
+		log.Println("!!!!! f.readat", p.id, p.offset, lo, hi, len(b))
+		if n, err = f.ReadAt(b, p.offset+lo); err != nil {
 			goto cachemiss
 		}
 		p.state.Store(2)
-		if err == nil && n != len(b) {
-			panic(nil)
-		}
 		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 2, p.offset, lo, hi, 2, "blue")
 		return n, nil
 
@@ -405,7 +405,7 @@ func (p *TorrPieceLinuxCache) MarkNotComplete() error {
 func (p *TorrPieceLinuxCache) Completion() ts.Completion {
 	state := p.state.Load()
 	return ts.Completion{
-		Complete: state > 0,
+		Complete: state > 0 && state < 4,
 		Ok:       true,
 		Err:      nil,
 	}
@@ -626,6 +626,7 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 	// loop until the buffer is filled or an error occurs
 	for nread := int64(0); nread < int64(len(buf)); {
 		if n, err = read(reader, offset, nread); err != nil {
+			log.Println("RETURN Pread error", offset, len(buf), nread, err)
 			return err
 		}
 		nread += n

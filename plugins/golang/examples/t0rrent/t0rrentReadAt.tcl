@@ -66,12 +66,12 @@ while {[gets stdin line] != -1} {
             continue
         }
         # Parse variables in the form KEY=value
-        set variables [regexp -all -inline {\w+=\S+} $line]
+#         set variables [regexp -all -inline {\w+=\S+} $line]
         set piece_index [lindex [regexp -inline {piece=(\d+)} $line] 1]
         set lo [lindex [regexp -inline {lo=(\d+)} $line] 1]
         set hi [lindex [regexp -inline {hi=(\d+)} $line] 1]
-        set state [lindex [regexp -inline {state=(\d+)} $line] 1]
-        set bstate [lindex [regexp -inline {bstate=(\d+)} $line] 1]
+#         set state [lindex [regexp -inline {state=(\d+)} $line] 1]
+#         set bstate [lindex [regexp -inline {bstate=(\d+)} $line] 1]
         set fill_color [lindex [regexp -inline {color=(\w+)} $line] 1]
 
         # Calculate the coordinates of the corresponding square
@@ -93,28 +93,34 @@ while {[gets stdin line] != -1} {
         set hi_mapped [expr {int(($hi / $piece_length) * ($square_inside_sz * $square_inside_sz))}]
 
         # Draw edge pixels of square
-        .c create rectangle $rect_x1 [expr {$rect_y1 - 1}] $rect_x2 [expr {$rect_y1 - 1}] -fill $fill_color -outline ""
-        .c create rectangle $rect_x1 [expr {$rect_y2 + 1}] $rect_x2 [expr {$rect_y2 + 1}] -fill $fill_color -outline ""
-        .c create rectangle [expr {$rect_x1 - 1}] $rect_y1 [expr {$rect_x1 - 1}] $rect_y2 -fill $fill_color -outline ""
-        .c create rectangle [expr {$rect_x2 + 1}] $rect_y1 [expr {$rect_x2 + 1}] $rect_y2 -fill $fill_color -outline ""
+        .c create rectangle $rect_x1 [expr {$rect_y1 - 1}] $rect_x2 [expr {$rect_y1 - 1}] -fill $fill_color -outline "" -tag rectangles
+        .c create rectangle $rect_x1 [expr {$rect_y2 + 1}] $rect_x2 [expr {$rect_y2 + 1}] -fill $fill_color -outline "" -tag rectangles
+        .c create rectangle [expr {$rect_x1 - 1}] $rect_y1 [expr {$rect_x1 - 1}] $rect_y2 -fill $fill_color -outline "" -tag rectangles
+        .c create rectangle [expr {$rect_x2 + 1}] $rect_y1 [expr {$rect_x2 + 1}] $rect_y2 -fill $fill_color -outline "" -tag rectangles
 
-        # Draw the pixels within the square
-        for {set y $rect_y1} {$y <= $rect_y2} {incr y} {
-            set rect_start_x $rect_x1
-            set rect_end_x $rect_x2
-            set inside_range_start [expr {$rect_x1 + $lo_mapped}]
-            set inside_range_end [expr {$rect_x1 + $hi_mapped}]
-            if {$inside_range_end < $rect_start_x || $inside_range_start > $rect_end_x} {
-                continue
+        if {$lo == 0 && $hi == $piece_length} {
+            .c create rectangle $rect_x1 $rect_y1 [expr {$rect_x2 + 1}] [expr {$rect_y2 + 1}] -fill $fill_color -outline "" -tag rectangles
+        } else {
+            # Draw the pixels within the square
+            for {set y $rect_y1} {$y <= $rect_y2} {incr y} {
+                set rect_start_x $rect_x1
+                set rect_end_x $rect_x2
+                set inside_range_start [expr {$rect_x1 + $lo_mapped}]
+                set inside_range_end [expr {$rect_x1 + $hi_mapped}]
+                if {$inside_range_end < $rect_start_x || $inside_range_start > $rect_end_x} {
+                    continue
+                }
+                if {$inside_range_start > $rect_start_x} {
+                    set rect_start_x $inside_range_start
+                }
+                if {$inside_range_end < $rect_end_x} {
+                    set rect_end_x $inside_range_end
+                }
+                .c create rectangle $rect_start_x $y [expr {$rect_end_x + 1}] [expr {$y + 1}] -fill $fill_color -outline "" -tag rectangles
             }
-            if {$inside_range_start > $rect_start_x} {
-                set rect_start_x $inside_range_start
-            }
-            if {$inside_range_end < $rect_end_x} {
-                set rect_end_x $inside_range_end
-            }
-            .c create rectangle $rect_start_x $y [expr {$rect_end_x + 1}] [expr {$y + 1}] -fill $fill_color -outline ""
         }
+#         .c delete rectangles
+        update
     } elseif {[regexp {debug: Pieces Length (\d+)} $line -> piece_length]} {
         if {$total_length > 0} {
             set redraw 1
@@ -126,5 +132,4 @@ while {[gets stdin line] != -1} {
     } elseif {[regexp {debug: File (.+)} $line -> filename]} {
         wm title . $filename
     }
-    update
 }
