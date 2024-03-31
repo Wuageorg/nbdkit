@@ -189,7 +189,7 @@ type TorrStorLinuxCache struct {
 
 	mu        sync.RWMutex
 	pieces	  []TorrPieceLinuxCache // Pieces
-	piecesPread map[int]bool
+	piecesPread map[int]int
 	piecesToThrash map[int]bool
 }
 
@@ -201,16 +201,19 @@ func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Has
 		pieceLength: info.PieceLength,
 		device:      device,
 		pieces:      make([]TorrPieceLinuxCache, pcnt, pcnt),
-		piecesPread: make(map[int]bool, 0),
+		piecesPread: make(map[int]int, 0),
 		piecesToThrash: make(map[int]bool, 0),
 	}
 }
 
-func (t *TorrStorLinuxCache) markPread(offset int64) {
-	pieceId := int(offset / t.pieceLength)
+func (t *TorrStorLinuxCache) markPread(lo int64, hi int64) {
+	pieceId := int(lo / t.pieceLength)
+	pieceIdEnd := int(hi / t.pieceLength) + 1
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.piecesPread[pieceId] = true
+	for ; pieceId <= pieceIdEnd; pieceId++ {
+		t.piecesPread[pieceId] += 1
+	}
 }
 
 
@@ -221,17 +224,20 @@ func (t *TorrStorLinuxCache) isPread(pieceId int, pieceState uint32) bool {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, ok := t.piecesPread[pieceId]; ok {
-		return true
+	if v, ok := t.piecesPread[pieceId]; ok {
+		return v > 0
 	}
 	return false
 }
 
-func (t *TorrStorLinuxCache) unmarkPread(offset int64) {
-	pieceId := int(offset / t.pieceLength)
+func (t *TorrStorLinuxCache) unmarkPread(lo int64, hi int64) {
+	pieceId := int(lo / t.pieceLength)
+	pieceIdEnd := int(hi / t.pieceLength) + 1
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.piecesPread, pieceId)
+	for ; pieceId <= pieceIdEnd; pieceId++ {
+		t.piecesPread[pieceId] -= 1
+	}
 }
 
 func (t *TorrStorLinuxCache) shouldThrash(offset int64) bool {
@@ -288,7 +294,6 @@ type TorrPieceLinuxCache struct {
 	// 1 - complete in memory
 	// 2 - only in linux cache
 	// 3 - Might Read loopback
-	// 4 - confirmed cache miss
 	state atomic.Uint32
 }
 
@@ -302,17 +307,17 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		if isPread {
 			return syscall.EAGAIN // read from nbdkit, honor the read
 		} else {
-			return syscall.EIO // read from another peer don't honor the read
+			return syscall.ECOMM // read from another peer don't honor the read
 		}
 	}
 	if beforeState > 2 { // before locking the piece, we check the read loopback situation
 		// cache miss
 		p.torrent.mu.Lock()
 		defer p.torrent.mu.Unlock()
-		p.state.Store(4) // set incomplete so caller doesn't loop
+		p.state.Store(0) // set incomplete so caller doesn't loop
 		p.torrent.piecesToThrash[p.id] = true
 		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 4, p.offset, lo, hi, beforeState, "purple")
-		return 0, syscall.EIO
+		return 0, reterr()
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -336,7 +341,7 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 1, p.offset, lo, hi, beforeState, map[bool]string{true: "aquamarine", false: "yellow"} [isPread])
 		if isPread {
 			p.readslots = p.readslots.merge(lo, hi)
-			if len(p.readslots) == 1 && p.readslots[0].start == 0 && p.readslots[0].stop == p.size && p.id != 0 && p.id != 1 && p.id != 8027 && p.id != 8026 && p.id != 8025  { // completly read
+			if len(p.readslots) == 1 && p.readslots[0].start == 0 && p.readslots[0].stop == p.size { // completly read
 				p.buf = nil // remove buf
 				p.readslots = nil
 				p.state.Store(2)
@@ -346,17 +351,21 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		return n, nil
 	case 2: // ReadAt from another peer
 		// read from linux cache
-		p.state.Store(3)
 		var err error
+		var f *os.File
 		n := 0
-		// don't even try ReadAt if isPread
 		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 3, p.offset, lo, hi, 3, map[bool]string{true: "teal", false: "orange"} [isPread])
-		f, err := os.Open(*p.device)
+		if isPread {
+			// don't even try to read block device, the piece is marked as 'complete in cache' and the call is from PRead, so it is a cachemiss
+			err = syscall.EAGAIN
+			goto cachemiss
+		}
+		p.state.Store(3)
+		f, err = os.Open(*p.device)
 		if err != nil {
 			goto cachemiss
 		}
 		defer f.Close()
-		log.Println("!!!!! f.readat", p.id, p.offset, lo, hi, len(b))
 		if n, err = f.ReadAt(b, p.offset+lo); err != nil {
 			goto cachemiss
 		}
@@ -367,9 +376,6 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	cachemiss: // goto label // err != nil -> cache miss
 		p.readslots = nil
 		p.state.Store(0)
-		p.torrent.mu.Lock()
-		defer p.torrent.mu.Unlock()
-		delete(p.torrent.piecesToThrash, p.id)
 		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 0, p.offset, lo, hi, 3, "red")
 		return 0, err
 	default:
@@ -384,6 +390,9 @@ func (p *TorrPieceLinuxCache) WriteAt(b []byte, off int64) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.buf == nil {
+		p.torrent.mu.Lock()
+		defer p.torrent.mu.Unlock()
+		delete(p.torrent.piecesToThrash, p.id)
 		p.buf = make([]byte, p.size, p.size)
 	}
 	return copy(p.buf[lo:hi:hi], b), nil
@@ -405,7 +414,7 @@ func (p *TorrPieceLinuxCache) MarkNotComplete() error {
 func (p *TorrPieceLinuxCache) Completion() ts.Completion {
 	state := p.state.Load()
 	return ts.Completion{
-		Complete: state > 0 && state < 4,
+		Complete: state > 0,
 		Ok:       true,
 		Err:      nil,
 	}
@@ -580,15 +589,15 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 		case pos != offset:
 			return nbdkit.PluginError{
 				Errmsg: "Seek failed",
-				Errno:  syscall.ESPIPE,
+				Errno:  syscall.EBADF,
 			}
 		}
 		return nil
 	}
 
 	read := func(reader torrent.Reader, offset int64, nread int64) (n int64, err error) {
-		c.plugin.torrentStor.markPread(offset + nread)
-		defer c.plugin.torrentStor.unmarkPread(offset + nread) // this will save the value of nread here
+		c.plugin.torrentStor.markPread(offset + nread, offset + int64(len(buf)))
+		defer c.plugin.torrentStor.unmarkPread(offset + nread, offset + int64(len(buf))) // this will save the value of nread here
 		var nI int
 		if nI, err = reader.ReadContext(NewCacheMissContext(c.plugin.torrentStor.shouldThrash, offset), buf[int(nread):]); err != nil {
 			n = int64(nI)
@@ -611,6 +620,7 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 			if !(err == io.EOF && n != 0) {
 				return
 			}
+			err = nil // remove io.EOF
 		}
 		n = int64(nI)
 		return
@@ -634,7 +644,11 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 	return nil
 }
 
-// Implement context for to thrash pieces
+// Implement context to thrash pieces
+// if we have a cachemiss with a readloopback
+// we want to get out, anacrolix code will not wait
+// for the read to complete if context.Done() returns
+// a closed channel and an error.
 type CacheMissContext struct {
 	checkFunc func(int64) bool
 	offset int64
@@ -663,7 +677,7 @@ func (c CacheMissContext) Done()  <-chan struct{} {
 
 // Called if Done() returns a value
 func (CacheMissContext) Err() error {
-	return syscall.EIO
+	return syscall.EDEADLK
 }
 
 func (CacheMissContext) Value(key any) any {
