@@ -243,7 +243,7 @@ func (t *TorrStorLinuxCache) shouldThrash(offset int64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, ok := t.piecesToThrash[pieceId]; ok {
-		log.Println("------- shouldThrash true", pieceId, offset)
+		// log.Println("------- shouldThrash true", pieceId, offset)
 		return true
 	}
 	return false
@@ -305,7 +305,7 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		if isPread {
 			return syscall.EAGAIN // read from nbdkit, honor the read
 		} else {
-			return syscall.ECOMM // read from another peer don't honor the read
+			return syscall.EIO // read from another peer don't honor the read
 		}
 	}
 	if beforeState > 2 { // before locking the piece, we check the read loopback situation
@@ -326,10 +326,11 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	}
 	switch state {
 	case 0: // use membuf
-		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, state, p.offset, lo, hi, beforeState, "green")
-		if p.buf == nil {
+		if !isPread || p.buf == nil {
+			log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 0, p.offset, lo, hi, 0, "red")
 			return 0, reterr()
 		}
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, state, p.offset, lo, hi, beforeState, "green")
 		return copy(b, p.buf[lo:hi:hi]), nil
 	case 1: // not entirely in linux cache
 		n := copy(b, p.buf[lo:hi:hi])
@@ -374,7 +375,7 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 	cachemiss: // goto label // err != nil -> cache miss
 		p.readslots = nil
 		p.state.Store(0)
-		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 0, p.offset, lo, hi, 3, "red")
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 0, p.offset, lo, hi, 3, "darkred")
 		return 0, err
 	default:
 		panic(state)
@@ -593,12 +594,14 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 		return nil
 	}
 
+	lenBuf := int64(len(buf))
 	read := func(reader torrent.Reader, offset int64, nread int64) (n int64, err error) {
-		c.plugin.torrentStor.markPread(offset+nread, offset+int64(len(buf)))
-		defer c.plugin.torrentStor.unmarkPread(offset+nread, offset+int64(len(buf))) // this will save the value of nread here
+		c.plugin.torrentStor.markPread(offset+nread, offset+lenBuf)
+		// defer c.plugin.torrentStor.unmarkPread(offset+nread, offset+int64(len(buf))) // this will save the value of nread here
 		var nI int
 		if nI, err = reader.ReadContext(NewCacheMissContext(c.plugin.torrentStor.shouldThrash, offset), buf[int(nread):]); err != nil {
 			n = int64(nI)
+			c.plugin.torrentStor.unmarkPread(offset+nread, offset+lenBuf)
 			// On cache miss we get syscall.EAGAIN but we still want to
 			// honor the PRead so try to read a second time
 			if err == syscall.EAGAIN {
@@ -621,6 +624,7 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 			err = nil // remove io.EOF
 		}
 		n = int64(nI)
+		c.plugin.torrentStor.unmarkPread(offset+nread, offset+lenBuf)
 		return
 	}
 
@@ -630,16 +634,14 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 	reader := c.readerfun()
 	defer reader.Close()
 
-	seek(reader, offset)
+	err = seek(reader, offset)
 	// loop until the buffer is filled or an error occurs
-	for nread := int64(0); nread < int64(len(buf)); {
-		if n, err = read(reader, offset, nread); err != nil {
-			log.Println("RETURN Pread error", offset, len(buf), nread, err)
-			return err
-		}
+	for nread := int64(0); err == nil && nread < lenBuf; {
+		n, err = read(reader, offset, nread)
 		nread += n
 	}
-	return nil
+	// log.Println("RETURN Pread error", offset, lenBuf, err)
+	return err
 }
 
 // Implement context to thrash pieces
@@ -675,7 +677,7 @@ func (c CacheMissContext) Done() <-chan struct{} {
 
 // Called if Done() returns a value
 func (CacheMissContext) Err() error {
-	return syscall.EDEADLK
+	return syscall.EAGAIN
 }
 
 func (CacheMissContext) Value(key any) any {
