@@ -211,8 +211,10 @@ func (t *TorrStorLinuxCache) markPread(lo int64, hi int64) {
 	pieceIdEnd := int(hi/t.pieceLength) + 1
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for ; pieceId <= pieceIdEnd; pieceId++ {
-		t.piecesPread[pieceId] += 1
+	for ; pieceId < pieceIdEnd; pieceId++ {
+		if t.pieces[pieceId].state.Load() < 3 { // if piece.state is 3, it is checking the cache through the device
+			t.piecesPread[pieceId] += 1
+		}
 	}
 }
 
@@ -233,8 +235,13 @@ func (t *TorrStorLinuxCache) unmarkPread(lo int64, hi int64) {
 	pieceIdEnd := int(hi/t.pieceLength) + 1
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for ; pieceId <= pieceIdEnd; pieceId++ {
-		t.piecesPread[pieceId] -= 1
+	for ; pieceId < pieceIdEnd; pieceId++ {
+		if t.pieces[pieceId].state.Load() < 3 { // if piece.state is 3, it is checking the cache through the device
+			t.piecesPread[pieceId] -= 1
+			if t.piecesPread[pieceId] < 0 {
+				t.piecesPread[pieceId] = 0
+			}
+		}
 	}
 }
 
@@ -243,7 +250,6 @@ func (t *TorrStorLinuxCache) shouldThrash(offset int64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, ok := t.piecesToThrash[pieceId]; ok {
-		// log.Println("------- shouldThrash true", pieceId, offset)
 		return true
 	}
 	return false
@@ -650,13 +656,13 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 // for the read to complete if context.Done() returns
 // a closed channel and an error.
 type CacheMissContext struct {
-	checkFunc func(int64) bool
+	shouldThrash func(int64) bool
 	offset    int64
 }
 
-func NewCacheMissContext(checkFunc func(int64) bool, offset int64) CacheMissContext {
+func NewCacheMissContext(shouldThrash func(int64) bool, offset int64) CacheMissContext {
 	return CacheMissContext{
-		checkFunc: checkFunc,
+		shouldThrash: shouldThrash,
 		offset:    offset,
 	}
 }
@@ -666,7 +672,7 @@ func (CacheMissContext) Deadline() (deadline time.Time, ok bool) {
 }
 
 func (c CacheMissContext) Done() <-chan struct{} {
-	if c.checkFunc(c.offset) {
+	if c.shouldThrash(c.offset) {
 		var closedChan = make(chan struct{})
 		close(closedChan)
 		return closedChan
