@@ -22,12 +22,12 @@ import (
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
+	"github.com/anacrolix/torrent/peer_protocol"
 	ts "github.com/anacrolix/torrent/storage"
 )
 
 // Needs
 // 14 local peers discovery missing
-// 54 idonthave missing
 // 52 bittorentv2 missing (is on master)
 // torrent modifications
 
@@ -36,6 +36,7 @@ import (
 // 29 uTorrent transport protocol
 // 27 private torrents
 // 7 ipv6
+// 6 fast extension (Have All/Have None, *Reject Request*: <len=0x000D><op=0x10><index><begin><length>)
 // 5 dht
 
 // FIXME how to not compile anacrolix webrtc stuff
@@ -139,6 +140,7 @@ func (s *StorLinuxCache) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash
 	s.torrs[h] = torr
 	// TODO add torrent capacity https://pkg.go.dev/github.com/anacrolix/torrent@v1.54.1/storage#TorrentCapacity
 	// this will remove the log when a piece is anaivailable for a peer
+	// https://github.com/anacrolix/torrent/blob/967dc8b0d3680744a8f8872a30d5f249e320c755/peerconn.go#L678
 	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush}, nil
 }
 
@@ -209,7 +211,7 @@ func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Has
 func (t *TorrStorLinuxCache) applyOnPieceInRange(lo int64, hi int64, f func (int)) {
 	pStart := int(lo / t.pieceLength)
 	pEnd := int(hi / t.pieceLength)
-	for ; pStart < pEnd; pStart++ {
+	for ; pStart < pEnd + 1; pStart++ {
 		f(pStart)
 	}
 }
@@ -243,7 +245,7 @@ func (t *TorrStorLinuxCache) unmarkPread(lo int64, hi int64) {
 	defer t.mu.Unlock()
 	t.applyOnPieceInRange(lo, hi, func(pId int) {
 		if t.pieces[pId].state.Load() < 3 { // if piece.state is 3, it is checking the cache through the device
-			log.Println("@PREAD", pId, t.piecesPread[pId] - 1)
+			log.Println("PREAD", pId, t.piecesPread[pId] - 1)
 			t.piecesPread[pId] -= 1
 		}
 
@@ -355,7 +357,7 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 				p.buf = nil // remove buf
 				p.readslots = nil
 				p.state.Store(2)
-				log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 2, p.offset, 0, p.size, 2, "cyan")
+				log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 2, p.offset, 0, p.size, 2, "teal")
 			}
 		}
 		return n, nil
@@ -364,13 +366,13 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		var err error
 		var f *os.File
 		n := 0
-		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 3, p.offset, lo, hi, 3, map[bool]string{true: "teal", false: "orange"}[isPread])
 		if isPread {
 			// don't even try to read block device, the piece is marked as 'complete in cache' and the call is from PRead, so it is a cachemiss
 			err = syscall.EAGAIN
 			goto cachemiss
 		}
 		p.state.Store(3)
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 3, p.offset, lo, hi, 3, "orange")
 		f, err = os.Open(*p.device)
 		if err != nil {
 			goto cachemiss
@@ -490,6 +492,11 @@ func (p *T0rrentPlugin) GetReady() error {
 	conf.DisableIPv4 = false
 	conf.DisableTCP = true
 	conf.DisableUTP = false
+	// extensions := peer_protocol.NewPeerExtensionBytes(peer_protocol.ExtensionBitDht | peer_protocol.ExtensionBitFast | peer_protocol.ExtensionBitAzureusMessagingProtocol | peer_protocol.ExtensionBitAzureusExtensionNegotiation1 | peer_protocol.ExtensionBitAzureusExtensionNegotiation2 | peer_protocol.ExtensionBitLtep | peer_protocol.ExtensionBitLocationAwareProtocol) // ExtensionBitV2Upgrade
+	extensions := peer_protocol.NewPeerExtensionBytes(peer_protocol.ExtensionBitDht | peer_protocol.ExtensionBitFast) // ExtensionBitV2Upgrade
+	extensions = extensions
+	// conf.Extensions = extensions
+	conf.MinPeerExtensions = extensions
 	conf.DefaultStorage = p.stor
 	// conf.Debug = true
 
@@ -617,9 +624,9 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 			// honor the PRead so try to read a second time
 			if err == syscall.EAGAIN {
 				log.Println("RETRY PREAD", offset, nread)
-				// c.plugin.torrentStor.applyOnPieceInRange(offset + nread, offset + nread + lenBuf, func(pId int) {
-				// 	c.plugin.t.Piece(pId).UpdateCompletion()
-				// })
+				c.plugin.torrentStor.applyOnPieceInRange(offset + nread, offset + nread + lenBuf, func(pId int) {
+					c.plugin.t.Piece(pId).UpdateCompletion()
+				})
 				if err = seek(reader, offset+nread); err != nil {
 					return
 				}
@@ -634,9 +641,9 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 			// but we don't want to err out nbdkit if it is indeed the
 			// last block of data
 			if !(err == io.EOF && n != 0) {
-				// c.plugin.torrentStor.applyOnPieceInRange(offset + nread, offset + nread + lenBuf, func(pId int) {
-				// 	c.plugin.t.Piece(pId).UpdateCompletion()
-				// })
+				c.plugin.torrentStor.applyOnPieceInRange(offset + nread, offset + nread + lenBuf, func(pId int) {
+					c.plugin.t.Piece(pId).UpdateCompletion()
+				})
 				return
 			}
 			err = nil // remove io.EOF
