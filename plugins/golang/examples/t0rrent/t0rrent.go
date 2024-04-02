@@ -138,7 +138,7 @@ func (s *StorLinuxCache) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash
 	torr := NewTorrStor(s, info, infoHash, s.device)
 	s.torrs[h] = torr
 	// TODO add torrent capacity https://pkg.go.dev/github.com/anacrolix/torrent@v1.54.1/storage#TorrentCapacity
-	// this will remove the log when a piece is anaivailable
+	// this will remove the log when a piece is anaivailable for a peer
 	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush}, nil
 }
 
@@ -206,16 +206,24 @@ func NewTorrStor(storage *StorLinuxCache, info *metainfo.Info, hash metainfo.Has
 	}
 }
 
+func (t *TorrStorLinuxCache) applyOnPieceInRange(lo int64, hi int64, f func (int)) {
+	pStart := int(lo / t.pieceLength)
+	pEnd := int(hi / t.pieceLength)
+	for ; pStart < pEnd; pStart++ {
+		f(pStart)
+	}
+}
+
 func (t *TorrStorLinuxCache) markPread(lo int64, hi int64) {
-	pieceId := int(lo / t.pieceLength)
-	pieceIdEnd := int(hi/t.pieceLength) + 1
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for ; pieceId < pieceIdEnd; pieceId++ {
-		if t.pieces[pieceId].state.Load() < 3 { // if piece.state is 3, it is checking the cache through the device
-			t.piecesPread[pieceId] += 1
+	t.applyOnPieceInRange(lo, hi, func(pId int) {
+		if t.pieces[pId].state.Load() < 3 { // if piece.state is 3, it is checking the cache through the device
+			log.Println("@PREAD", pId, t.piecesPread[pId] + 1)
+			t.piecesPread[pId] += 1
 		}
-	}
+
+	})
 }
 
 func (t *TorrStorLinuxCache) isPread(pieceId int, pieceState uint32) bool {
@@ -231,18 +239,15 @@ func (t *TorrStorLinuxCache) isPread(pieceId int, pieceState uint32) bool {
 }
 
 func (t *TorrStorLinuxCache) unmarkPread(lo int64, hi int64) {
-	pieceId := int(lo / t.pieceLength)
-	pieceIdEnd := int(hi/t.pieceLength) + 1
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for ; pieceId < pieceIdEnd; pieceId++ {
-		if t.pieces[pieceId].state.Load() < 3 { // if piece.state is 3, it is checking the cache through the device
-			t.piecesPread[pieceId] -= 1
-			if t.piecesPread[pieceId] < 0 {
-				t.piecesPread[pieceId] = 0
-			}
+	t.applyOnPieceInRange(lo, hi, func(pId int) {
+		if t.pieces[pId].state.Load() < 3 { // if piece.state is 3, it is checking the cache through the device
+			log.Println("@PREAD", pId, t.piecesPread[pId] - 1)
+			t.piecesPread[pId] -= 1
 		}
-	}
+
+	})
 }
 
 func (t *TorrStorLinuxCache) shouldThrash(offset int64) bool {
@@ -320,7 +325,7 @@ func (p *TorrPieceLinuxCache) ReadAt(b []byte, off int64) (int, error) {
 		defer p.torrent.mu.Unlock()
 		p.state.Store(0) // set incomplete so caller doesn't loop
 		p.torrent.piecesToThrash[p.id] = true
-		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 4, p.offset, lo, hi, beforeState, "purple")
+		log.Printf("|ReadAt piece=%d state=%d poff=%d lo=%d hi=%d bstate=%d color=%s\n", p.id, 3, p.offset, lo, hi, beforeState, "purple")
 		return 0, reterr()
 	}
 	p.mu.Lock()
@@ -611,6 +616,10 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 			// On cache miss we get syscall.EAGAIN but we still want to
 			// honor the PRead so try to read a second time
 			if err == syscall.EAGAIN {
+				log.Println("RETRY PREAD", offset, nread)
+				// c.plugin.torrentStor.applyOnPieceInRange(offset + nread, offset + nread + lenBuf, func(pId int) {
+				// 	c.plugin.t.Piece(pId).UpdateCompletion()
+				// })
 				if err = seek(reader, offset+nread); err != nil {
 					return
 				}
@@ -625,6 +634,9 @@ func (c *T0rrentConnection) PRead(buf []byte, offseta uint64, flags uint32) erro
 			// but we don't want to err out nbdkit if it is indeed the
 			// last block of data
 			if !(err == io.EOF && n != 0) {
+				// c.plugin.torrentStor.applyOnPieceInRange(offset + nread, offset + nread + lenBuf, func(pId int) {
+				// 	c.plugin.t.Piece(pId).UpdateCompletion()
+				// })
 				return
 			}
 			err = nil // remove io.EOF
