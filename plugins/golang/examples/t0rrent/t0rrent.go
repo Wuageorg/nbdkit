@@ -41,6 +41,8 @@ import (
 
 // FIXME how to not compile anacrolix webrtc stuff
 // TODO benchmark with rusage and ram graph tui
+// TODO test, transform this file with sed and add a main
+// TODO webseed?
 
 const TIMEOUT = 10
 
@@ -515,24 +517,12 @@ func (p *T0rrentPlugin) GetReady() error {
 
 // Open prepares the plugin for serving a client connection.
 func (p *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
-	// p.t.PieceState()
-	// func (t *Torrent) AddWebSeeds(urls []string, opts ...AddWebSeedsOpt)
-	// func (t *Torrent) AddTrackers(announceList [][]string)
-	// func (t *Torrent) AddPeers(pp []PeerInfo) (n int)
-	// func (t *Torrent) CancelPieces(begin, end pieceIndex)
-	// func (t *Torrent) DownloadPieces(begin, end pieceIndex)
-	// func (t *Torrent) Length() int64
-	// func (t *Torrent) NumPieces() pieceIndex
-	// func (t *Torrent) Piece(i pieceIndex) *Piece
-	// func (t *Torrent) SubscribePieceStateChanges() *pubsub.Subscription[PieceStateChange]
-
 	select {
 	case <-p.t.GotInfo():
 		nbdkit.Debug(fmt.Sprint("Got torrent %s infos", p.t.InfoHash()))
 	case <-time.After(TIMEOUT * time.Second):
 		return nil, nbdkit.PluginError{Errmsg: fmt.Sprint("Timeout, did not got torrent %s infos in %d seconds", p.t.InfoHash(), TIMEOUT)}
 	}
-	<-p.t.GotInfo() // wait till with get torrent infos // TODO timeout and fail
 	nbdkit.Debug(fmt.Sprint("InfoHash ", p.t.InfoHash()))
 	nbdkit.Debug(fmt.Sprint("Name ", p.t.Info().BestName()))
 	nbdkit.Debug(fmt.Sprint("Pieces Length ", p.t.Info().PieceLength))
