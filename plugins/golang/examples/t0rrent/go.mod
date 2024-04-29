@@ -1,12 +1,15 @@
 module main
 
-go 1.18
+go 1.21
 
 replace libguestfs.org/nbdkit => ../../src/libguestfs.org/nbdkit
 
 require libguestfs.org/nbdkit v1.0.0
 
-require github.com/anacrolix/torrent v1.54.1
+require (
+	github.com/anacrolix/torrent v1.54.1
+	github.com/hashicorp/golang-lru/v2 v2.0.7
+)
 
 require (
 	crawshaw.io/sqlite v0.3.3-0.20220618202545-d1964889ea3c // indirect
