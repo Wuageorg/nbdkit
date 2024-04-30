@@ -9,6 +9,7 @@ require libguestfs.org/nbdkit v1.0.0
 require (
 	github.com/anacrolix/torrent v1.54.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/tysonmote/gommap v0.0.3
 )
 
 require (

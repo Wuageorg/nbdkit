@@ -25,6 +25,7 @@ import (
 	ts "github.com/anacrolix/torrent/storage"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	gommap "github.com/tysonmote/gommap"
 )
 
 // Needs
@@ -86,6 +87,10 @@ func NewStorage(device string) *Stor {
 	return stor
 }
 
+// this will remove the log when a piece is anaivailable for a peer
+// https://github.com/anacrolix/torrent/blob/967dc8b0d3680744a8f8872a30d5f249e320c755/peerconn.go#L678
+func (s *Stor) StorCapacity() (int64, bool) { return 1<<63 - 1, true }
+
 // OpenTorrent opens a torrent for reading.
 func (s *Stor) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (ts.TorrentImpl, error) {
 	h := infoHash.AsString()
@@ -93,9 +98,8 @@ func (s *Stor) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (ts.Torr
 	defer s.mu.Unlock()
 	torr := NewTorrStor(s, info, infoHash, s.device)
 	s.torrs[h] = torr
-	// TODO add torrent capacity https://pkg.go.dev/github.com/anacrolix/torrent@v1.54.1/storage#TorrentCapacity
-	// this will remove the log when a piece is anaivailable for a peer
-	// https://github.com/anacrolix/torrent/blob/967dc8b0d3680744a8f8872a30d5f249e320c755/peerconn.go#L678
+	// capaFun := s.StorCapacity
+	// return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush, Capacity: &capaFun}, nil
 	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush}, nil
 }
 
@@ -172,6 +176,36 @@ func NewTorrStor(storage *Stor, info *metainfo.Info, hash metainfo.Hash, device 
 	}
 }
 
+func isInBDLinuxCache(device *string, inter Interval) bool {
+	// TODO before doing an expensive syscall, check if anacrolix has the piece completed?, especially if it want it for writing
+	// TODO check actual linux cache
+	var err error
+	f, err := os.Open(*device)
+	if err != nil {
+		log.Printf("IIBDLC Err %v\n", err)
+		return false
+	}
+	defer f.Close()
+	mmap, err := gommap.MapRegion(f.Fd(), int64(inter.Lo), int64(inter.Hi-inter.Lo), gommap.PROT_READ, gommap.MAP_SHARED)
+	if err != nil {
+		log.Printf("IIBDLC Err %v\n", err)
+		return false
+	}
+	defer mmap.UnsafeUnmap()
+	residentPages, err := mmap.IsResident()
+	if err != nil {
+		log.Printf("IIBDLC Err %v\n", err)
+		return false
+	}
+	log.Printf("Resident %v %v\n", inter, residentPages)
+	for _, r := range residentPages {
+		if !r {
+			return false
+		}
+	}
+	return true
+}
+
 // Piece returns a piece of the torrent.
 func (t *TorrStor) Piece(m metainfo.Piece) ts.PieceImpl {
 	index := m.Index()
@@ -180,27 +214,25 @@ func (t *TorrStor) Piece(m metainfo.Piece) ts.PieceImpl {
 
 	log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "grey")
 	if p, ok := t.inFlight.Get(index); ok {
-		log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "purple")
+		log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "lightgreen")
 		return p
 	}
 
 	switch t.CanTryCache(Interval{uint64(off), uint64(off + plen)}, func(inter Interval) bool {
-		// TODO before doing an expensive syscall, check if anacrolix has the piece completed?, especially if it want it for writing
-		// TODO check actual linux cache
-		return false
+		return isInBDLinuxCache(&t.device, inter)
 	}) {
 	case CacheHit:
-		log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "blue")
+		log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "lightblue")
 		return &CacheHitPiece{device: &t.device, off: off}
 	case DropReq:
-		log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "red")
+		log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "salmon")
 		return &DropReqPiece{}
 	case HonorReq:
 		if p, ok := t.inFlight.Get(index); ok {
 			log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "violet")
 			return p
 		} else {
-			log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "green")
+			log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "orange")
 			p := &InFlightPiece{complete: false, written: false, buf: make([]byte, plen)}
 			t.inFlight.Add(index, p)
 			return p
