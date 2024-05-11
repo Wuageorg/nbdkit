@@ -64,16 +64,15 @@ def draw_piece(piece_index, lo, hi, fill_color):
     x2 = x_pos + square_size
     y2 = y_pos + square_size
 
-    # Calculate the coordinates of the rectangle within the square
-    rect_x1 = x_pos + 1
-    rect_x2 = x2 - 1
-    rect_y1 = y_pos + 1
-    rect_y2 = y2 - 1
-
     # Draw edge pixels of square
-    if not pixelperfect or (lo == 0 and hi == piece_length):
+    if lo == 0 and hi == piece_length:
         drawGlRect(fill_color, x_pos, y_pos, 1, 1, square_size - 1, square_size - 1)
     else:
+        # Calculate the coordinates of the rectangle within the square
+        rect_x1 = x_pos + 1
+        rect_x2 = x2 - 1
+        rect_y1 = y_pos + 1
+        rect_y2 = y2 - 1
         drawGlRect(fill_color, x_pos, y_pos, 1, 0, square_size - 1, 1)
         drawGlRect(fill_color, x_pos, y_pos, 1, 0, square_size - 1, 1)
         drawGlRect(fill_color, x_pos, y_pos, 1, square_size - 1, square_size - 1, 1)
@@ -155,7 +154,7 @@ for line in sys.stdin:
         redraw = 0
         glFlush()
 
-    if "|ReadAt " in line:
+    if "|Piece " in line:
         if piece_length == 0:
             continue
 
@@ -163,8 +162,8 @@ for line in sys.stdin:
         piece = line.split()
         draw_piece(
             int(parse_kv(piece, "piece=")),
-            int(parse_kv(piece, "lo=")),
-            int(parse_kv(piece, "hi=")),
+            int(0),
+            int(piece_length),
             parse_kv(piece, "color=")
         )
         glFlush()

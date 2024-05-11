@@ -5,28 +5,34 @@ import (
 	"C"
 	"unsafe"
 
-	"runtime"
-	"runtime/debug"
-
+	"bufio"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"crypto/sha1"
+
 	"libguestfs.org/nbdkit"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
-	"github.com/anacrolix/torrent/peer_protocol"
+
+	// "github.com/anacrolix/torrent/peer_protocol"
 	ts "github.com/anacrolix/torrent/storage"
 
+	gofibmap "github.com/frostschutz/go-fibmap"
 	lru "github.com/hashicorp/golang-lru/v2"
 	gommap "github.com/tysonmote/gommap"
 )
+import "reflect"
 
 // Needs
 // 14 local peers discovery missing
@@ -74,16 +80,16 @@ func (a Interval) IsOverlapping(b Interval) bool {
 type Stor struct {
 	ts.ClientImpl
 
-	device string
-	torrs  map[string]*TorrStor
-	mu     sync.Mutex
+	mountpoint string
+	torrs      map[metainfo.Hash]*TorrStor
+	mu         sync.Mutex
 }
 
 // NewStorage creates a new Stor instance.
-func NewStorage(device string) *Stor {
+func NewStorage(mountpoint string) *Stor {
 	stor := new(Stor)
-	stor.device = device // eg: "/dev/nbd0"
-	stor.torrs = make(map[string]*TorrStor)
+	stor.mountpoint = mountpoint // eg: "/mnt"
+	stor.torrs = make(map[metainfo.Hash]*TorrStor)
 	return stor
 }
 
@@ -93,14 +99,22 @@ func (s *Stor) StorCapacity() (int64, bool) { return 1<<63 - 1, true }
 
 // OpenTorrent opens a torrent for reading.
 func (s *Stor) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (ts.TorrentImpl, error) {
-	h := infoHash.AsString()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	torr := NewTorrStor(s, info, infoHash, s.device)
-	s.torrs[h] = torr
-	// capaFun := s.StorCapacity
-	// return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush, Capacity: &capaFun}, nil
-	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush}, nil
+	torr := NewTorrStor(s, info, s.mountpoint)
+	s.torrs[infoHash] = torr
+	capaFun := s.StorCapacity
+	return ts.TorrentImpl{Piece: torr.Piece, Close: torr.Close, Flush: torr.Flush, Capacity: &capaFun}, nil
+}
+
+func (s *Stor) SetTorrentsPtrs(client *torrent.Client) {
+	for hash, st := range s.torrs {
+		if ctorr, ok := client.Torrent(hash); !ok {
+			panic(nil)
+		} else {
+			st.torrent = ctorr
+		}
+	}
 }
 
 // CloseTorrent closes a torrent.
@@ -108,16 +122,12 @@ func (s *Stor) CloseHash(hash metainfo.Hash) {
 	if s.torrs == nil {
 		return
 	}
-	h := hash.AsString()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if torr, ok := s.torrs[h]; ok {
+	if torr, ok := s.torrs[hash]; ok {
 		torr.Close()
-		delete(s.torrs, h)
+		delete(s.torrs, hash)
 	}
-
-	runtime.GC()
-	debug.FreeOSMemory()
 }
 
 // Close closes the storage and releases associated resources.
@@ -125,6 +135,7 @@ func (s *Stor) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, torr := range s.torrs {
+		torr.torrent = nil // avoid reference loop
 		torr.Close()
 	}
 	return nil
@@ -134,10 +145,204 @@ func (s *Stor) Close() error {
 func (s *Stor) GetTorrStor(hash metainfo.Hash) *TorrStor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if torr, ok := s.torrs[hash.AsString()]; ok {
+	if torr, ok := s.torrs[hash]; ok {
 		return torr
 	}
 	return nil
+}
+
+type CachedFile struct {
+	inter Interval
+	path  *string
+}
+
+type MountCacheInfos struct {
+	files []CachedFile
+}
+
+// TorrStor represents a torrent data pieces.
+type TorrStor struct {
+	// iface ts.TorrentImpl
+	torrent     *torrent.Torrent
+	stor        *Stor
+	pieceLength int64
+	isClosed    bool
+	mountpoint  string
+
+	mu       sync.Mutex
+	preading []*Interval // Intervals being pread
+	inFlight *lru.Cache[int, *InFlightPiece]
+
+	mumci sync.Mutex
+	mci   *MountCacheInfos
+}
+
+// NewTorrStor creates a new TorrStor instance.
+func NewTorrStor(storage *Stor, info *metainfo.Info, mountpoint string) *TorrStor {
+	inFlight, err := lru.New[int, *InFlightPiece](8)
+	if err != nil {
+		panic(err)
+	}
+	ret := &TorrStor{
+		stor:        storage,
+		pieceLength: info.PieceLength,
+		mountpoint:  mountpoint,
+		preading:    make([]*Interval, 0),
+		inFlight:    inFlight,
+	}
+
+	go func() {
+		for {
+			if ret.mci == nil {
+				// TODO use a gorountine
+				// FIXME cannot exit nbdkit if stuck in lock
+				log.Print("Locked")
+				ret.mumci.Lock()
+				log.Print("Locked inside")
+				if ret.mci == nil {
+					log.Printf("Alllocating !!!!\n")
+					ret.mci = NewMountCacheInfo(&ret.mountpoint)
+					log.Printf(".... Alllocated %p\n", ret.mci)
+				}
+				log.Print("UnLocked before")
+				ret.mumci.Unlock()
+				log.Print("UnLocked")
+			}
+			time.Sleep(2 * time.Second) // Check every 2seconds
+		}
+	}()
+
+	return ret
+}
+
+func NewMountCacheInfo(mountpoint *string) *MountCacheInfos {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		log.Printf("Err: %v\n", err)
+		return nil
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Split(bufio.ScanLines)
+	mounted := false
+	isNbd := false
+	for scanner.Scan() {
+		l := scanner.Text()
+		if index := strings.Index(l, *mountpoint); index > 0 {
+			mounted = true
+			if strings.Contains(l[index:], "/dev/nbd") {
+				isNbd = true
+			}
+		}
+	}
+	if err = scanner.Err(); err != nil {
+		log.Printf("Err: %v\n", err)
+		return nil
+	}
+	if !mounted {
+		return nil // not mounted yet
+	}
+	if !isNbd {
+		log.Printf("Err: %s\n", "Mountpoint is mounted but is not an NBD")
+		return nil
+	}
+	log.Printf("Walkdir\n")
+	ret := MountCacheInfos{files: make([]CachedFile, 0)}
+	filepath.WalkDir(*mountpoint, func(path string, _d fs.DirEntry, err error) error {
+		if err != nil {
+			log.Printf("Err walkdir: %v\n", err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		fmf := gofibmap.NewFibmapFile(f)
+		extents, err := fmf.FibmapExtents()
+		for _, extent := range extents {
+			ret.files = append(ret.files, CachedFile{path: &path, inter: Interval{extent.Physical, extent.Physical + extent.Length}})
+
+		}
+		return nil
+	})
+	slices.SortFunc(ret.files, func(a, b CachedFile) int {
+		return int(a.inter.Lo - b.inter.Lo)
+	})
+	log.Printf("Neeeeew %d\n", len(ret.files))
+	return &ret
+}
+
+func (t *TorrStor) cacheMmap(inter Interval) *CacheHitPiece {
+	if t.mci == nil {
+		return nil
+	}
+
+	idx, found := slices.BinarySearchFunc(t.mci.files, inter, func(cf CachedFile, inter Interval) int {
+		if inter.Lo < cf.inter.Hi && inter.Lo >= cf.inter.Lo {
+			return 0
+		}
+		if inter.Lo < cf.inter.Lo {
+			return 1
+		}
+		return -1
+	})
+	if !found {
+		log.Printf("Notound %v\n", inter)
+		return nil
+	}
+
+	pagesize := uint64(syscall.Getpagesize()) // https://github.com/golang/go/commit/1b9499b06989d2831e5b156161d6c07642926ee1
+	bRemaining := int(inter.Hi - inter.Lo)
+	ret := new(CacheHitPiece)
+	ret.buf = make([]byte, inter.Hi-inter.Lo)
+	for bRemaining > 0 && idx < len(t.mci.files) {
+		cf := t.mci.files[idx]
+		foff, length := inter.Lo-cf.inter.Lo, min(uint64(bRemaining), cf.inter.Hi-cf.inter.Lo)
+		moff, flength := uint64(0), length
+		// Align on pagesize
+		if foff%pagesize != 0 {
+			nfoff := (foff - min(foff, pagesize)) & ^(pagesize - 1) // align down
+			moff = (foff - nfoff)
+			flength += moff
+			foff = nfoff
+		}
+		if flength%pagesize != 0 {
+			flength = (flength + pagesize) & ^(pagesize - 1) // align up
+		}
+		log.Printf("%v %s lo hi %d %d %d %d %d %d\n", inter, *cf.path, foff, length, foff%pagesize, length%pagesize, moff, flength)
+
+		f, err := os.Open(*cf.path)
+		if err != nil {
+			log.Printf("Err opening %s %v\n", *cf.path, err)
+			return nil
+		}
+		mmap, err := gommap.MapAt(0, f.Fd(), int64(foff), int64(flength), gommap.PROT_READ, gommap.MAP_SHARED)
+		f.Close() // close file
+		if err != nil {
+			log.Printf("MapAt Err %v\n", err)
+			return nil
+		}
+		defer func() {
+			if err := mmap.UnsafeUnmap(); err != nil {
+				log.Printf("UnsafeUnmap Err: %v\n", err)
+			}
+		}()
+		residentPages, err := mmap.IsResident()
+		if err != nil {
+			log.Printf("IsResident Err %v\n", err)
+			return nil
+		}
+		for i, r := range residentPages {
+			if !r {
+				i = i
+				log.Printf("%v page %d not resident", inter, i)
+				return nil
+			}
+		}
+		n := copy(ret.buf[len(ret.buf)-bRemaining:], mmap[moff:(moff+length)])
+		bRemaining -= n
+		idx += 1
+	}
+	return ret
 }
 
 const (
@@ -146,64 +351,8 @@ const (
 	CacheHit int = iota
 )
 
-// TorrStor represents a torrent data pieces.
-type TorrStor struct {
-	// iface ts.TorrentImpl
-	hash        metainfo.Hash
-	stor        *Stor
-	pieceLength int64
-	isClosed    bool
-	device      string
-
-	mu       sync.Mutex
-	preading []*Interval // Intervals being pread
-	inFlight *lru.Cache[int, *InFlightPiece]
-}
-
-// // NewTorrStor creates a new TorrStor instance.
-func NewTorrStor(storage *Stor, info *metainfo.Info, hash metainfo.Hash, device string) *TorrStor {
-	inFlight, err := lru.New[int, *InFlightPiece](8)
-	if err != nil {
-		panic(err)
-	}
-	return &TorrStor{
-		hash:        hash,
-		stor:        storage,
-		pieceLength: info.PieceLength,
-		device:      device,
-		preading:    make([]*Interval, 0),
-		inFlight:    inFlight,
-	}
-}
-
-func isInBDLinuxCache(device *string, inter Interval) bool {
-	// TODO before doing an expensive syscall, check if anacrolix has the piece completed?, especially if it want it for writing
-	// TODO check actual linux cache
-	var err error
-	f, err := os.Open(*device)
-	if err != nil {
-		log.Printf("IIBDLC Err %v\n", err)
-		return false
-	}
-	defer f.Close()
-	mmap, err := gommap.MapRegion(f.Fd(), int64(inter.Lo), int64(inter.Hi-inter.Lo), gommap.PROT_READ, gommap.MAP_SHARED)
-	if err != nil {
-		log.Printf("IIBDLC Err %v\n", err)
-		return false
-	}
-	defer mmap.UnsafeUnmap()
-	residentPages, err := mmap.IsResident()
-	if err != nil {
-		log.Printf("IIBDLC Err %v\n", err)
-		return false
-	}
-	log.Printf("Resident %v %v\n", inter, residentPages)
-	for _, r := range residentPages {
-		if !r {
-			return false
-		}
-	}
-	return true
+func logPiece(index int, color string) {
+	log.Printf("|Piece piece=%d color=%s\n", index, color)
 }
 
 // Piece returns a piece of the torrent.
@@ -212,27 +361,31 @@ func (t *TorrStor) Piece(m metainfo.Piece) ts.PieceImpl {
 	off := m.Offset()
 	plen := m.Length()
 
-	log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "grey")
+	logPiece(index, "grey")
 	if p, ok := t.inFlight.Get(index); ok {
-		log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "lightgreen")
+		logPiece(index, "lightgreen")
 		return p
 	}
 
-	switch t.CanTryCache(Interval{uint64(off), uint64(off + plen)}, func(inter Interval) bool {
-		return isInBDLinuxCache(&t.device, inter)
-	}) {
+	typ, chp := t.CanTryCache(index, Interval{uint64(off), uint64(off + plen)})
+	switch typ {
 	case CacheHit:
-		log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "lightblue")
-		return &CacheHitPiece{device: &t.device, off: off}
+		logPiece(index, "lightblue")
+		a := m.Hash().Bytes()
+		b := sha1.Sum(chp.buf)
+		if !reflect.DeepEqual(a[:], b[:]) {
+			log.Printf("%d\n%x\n%x\n", index, a, b)
+		}
+		return chp
 	case DropReq:
-		log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "salmon")
+		logPiece(index, "salmon")
 		return &DropReqPiece{}
 	case HonorReq:
 		if p, ok := t.inFlight.Get(index); ok {
-			log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "violet")
+			logPiece(index, "violet")
 			return p
 		} else {
-			log.Printf("|ReadAt piece=%d lo=%d hi=%d color=%s\n", index, 0, plen, "orange")
+			logPiece(index, "orange")
 			p := &InFlightPiece{complete: false, written: false, buf: make([]byte, plen)}
 			t.inFlight.Add(index, p)
 			return p
@@ -279,21 +432,29 @@ func (t *TorrStor) PreadEnd(ownedInter *Interval) {
 	t.preading = copyFiltered
 }
 
-func (t *TorrStor) CanTryCache(inter Interval, isInCacheFunc func(inter Interval) bool) int {
-	{
-		t.mu.Lock()
-		defer t.mu.Unlock()
-
-		for _, interPtr := range t.preading {
-			if inter.IsOverlapping(*interPtr) {
-				return HonorReq // preading right now
-			}
+func (t *TorrStor) CanTryCache(index int, inter Interval) (int, *CacheHitPiece) {
+	// log.Println("lock")
+	t.mu.Lock()
+	for _, interPtr := range t.preading {
+		if inter.IsOverlapping(*interPtr) {
+			t.mu.Unlock()
+			return HonorReq, nil // preading right now
 		}
-	} // unlocked after this point
-	// make sure it is in cache by asking the oracle function (aka kernel syscall),
-	// if not in cache dropreq
-	inCache := isInCacheFunc(inter)
-	return map[bool]int{true: CacheHit, false: DropReq}[inCache]
+	}
+	t.mu.Unlock()
+
+	// Check anacrolix internal state
+	// log.Println("statein")
+	// if t.torrent == nil || !t.torrent.Piece(index).State().Complete {
+	// 	// piece incomplete and not preading -> no cache
+	// 	return DropReq, nil
+	// }
+	// log.Println("stateout")
+
+	// make sure it is in linux cache by asking the oracle function (aka kernel syscall),
+	// if not in cache DropReq
+	chp := t.cacheMmap(inter)
+	return map[bool]int{true: CacheHit, false: DropReq}[chp != nil], chp
 }
 
 type DropReqPiece struct{}
@@ -309,8 +470,7 @@ func (p *DropReqPiece) Completion() ts.Completion {
 }
 
 type CacheHitPiece struct {
-	device *string
-	off    int64
+	buf []byte
 }
 
 func (p *CacheHitPiece) MarkComplete() error                      { return nil }
@@ -321,15 +481,7 @@ func (p *CacheHitPiece) Completion() ts.Completion {
 }
 
 func (p *CacheHitPiece) ReadAt(b []byte, poff int64) (n int, err error) {
-	f, err := os.Open(*p.device)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	if n, err = f.ReadAt(b, p.off+poff); err != nil {
-		return 0, err
-	}
-	return n, nil
+	return copy(b, p.buf[poff:poff+int64(len(b))]), nil
 }
 
 type InFlightPiece struct {
@@ -376,7 +528,7 @@ func (p *InFlightPiece) MarkNotComplete() error {
 type T0rrentPlugin struct {
 	nbdkit.Plugin // iface
 	magnet        string
-	device        string
+	mountpoint    string
 	tManager      *torrent.Client
 	stor          *Stor
 	t             *torrent.Torrent
@@ -390,8 +542,8 @@ func (p *T0rrentPlugin) Config(key string, value string) error {
 		if !strings.HasPrefix(value, "magnet:") {
 			p.magnet = "magnet:?xt=urn:btih:" + value
 		}
-	case "device":
-		p.device = value
+	case "mountpoint":
+		p.mountpoint = value
 	default:
 		return nbdkit.PluginError{Errmsg: "unknown parameter " + key}
 	}
@@ -403,15 +555,15 @@ func (p *T0rrentPlugin) ConfigComplete() error {
 	switch {
 	case len(p.magnet) == 0:
 		return nbdkit.PluginError{Errmsg: "magnet parameter is required"}
-	case len(p.device) == 0:
-		return nbdkit.PluginError{Errmsg: "device parameter is required"}
+	case len(p.mountpoint) == 0:
+		return nbdkit.PluginError{Errmsg: "mountpoint parameter is required"}
 	}
 	return nil
 }
 
 // GetReady prepares the plugin for serving torrent data.
 func (p *T0rrentPlugin) GetReady() error {
-	p.stor = NewStorage(p.device)
+	p.stor = NewStorage(p.mountpoint)
 
 	conf := torrent.NewDefaultClientConfig()
 	conf.Seed = true
@@ -421,10 +573,10 @@ func (p *T0rrentPlugin) GetReady() error {
 	conf.DisableTCP = true
 	conf.DisableUTP = false
 	// extensions := peer_protocol.NewPeerExtensionBytes(peer_protocol.ExtensionBitDht | peer_protocol.ExtensionBitFast | peer_protocol.ExtensionBitAzureusMessagingProtocol | peer_protocol.ExtensionBitAzureusExtensionNegotiation1 | peer_protocol.ExtensionBitAzureusExtensionNegotiation2 | peer_protocol.ExtensionBitLtep | peer_protocol.ExtensionBitLocationAwareProtocol) // ExtensionBitV2Upgrade
-	extensions := peer_protocol.NewPeerExtensionBytes(peer_protocol.ExtensionBitDht | peer_protocol.ExtensionBitFast) // ExtensionBitV2Upgrade
-	extensions = extensions
+	// extensions := peer_protocol.NewPeerExtensionBytes(peer_protocol.ExtensionBitDht | peer_protocol.ExtensionBitFast) // ExtensionBitV2Upgrade
+	// extensions = extensions
 	// conf.Extensions = extensions
-	conf.MinPeerExtensions = extensions
+	// conf.MinPeerExtensions = extensions
 	conf.DefaultStorage = p.stor
 	// conf.Debug = true
 
@@ -435,11 +587,9 @@ func (p *T0rrentPlugin) GetReady() error {
 	if p.t, err = p.tManager.AddMagnet(p.magnet); err != nil {
 		return err
 	}
-	p.t.SetDisplayName("Downloading torrent metadata")
 	p.t.SetOnWriteChunkError(func(err error) {
 		log.Fatalf("writeChunkError %s\n", err)
 	})
-
 	return nil
 }
 
@@ -451,6 +601,7 @@ func (p *T0rrentPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 	case <-time.After(TIMEOUT * time.Second):
 		return nil, nbdkit.PluginError{Errmsg: fmt.Sprint("Timeout, did not got torrent %s infos in %d seconds", p.t.InfoHash(), TIMEOUT)}
 	}
+	p.stor.SetTorrentsPtrs(p.tManager)
 	nbdkit.Debug(fmt.Sprint("InfoHash ", p.t.InfoHash()))
 	nbdkit.Debug(fmt.Sprint("Name ", p.t.Info().BestName()))
 	nbdkit.Debug(fmt.Sprint("Pieces Length ", p.t.Info().PieceLength))
@@ -502,7 +653,7 @@ func (c *T0rrentConnection) PWrite(buf []byte, offset uint64,
 	return nil
 }
 
-// Close termitates the client connection.
+// Close terminates the client connection.
 func (c *T0rrentConnection) Close() {
 	c.tsize = 0
 }
