@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -32,7 +33,6 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	gommap "github.com/tysonmote/gommap"
 )
-import "reflect"
 
 // Needs
 // 14 local peers discovery missing
@@ -50,6 +50,7 @@ import "reflect"
 // FIXME how to not compile anacrolix webrtc stuff
 // TODO benchmark with rusage and ram graph tui
 // TODO webseed?
+// TODO limit memory usage (no new allocations, right now there is one when returning a cachedpiece)
 
 const TIMEOUT = 10
 
@@ -194,19 +195,11 @@ func NewTorrStor(storage *Stor, info *metainfo.Info, mountpoint string) *TorrSto
 	go func() {
 		for {
 			if ret.mci == nil {
-				// TODO use a gorountine
-				// FIXME cannot exit nbdkit if stuck in lock
-				log.Print("Locked")
 				ret.mumci.Lock()
-				log.Print("Locked inside")
 				if ret.mci == nil {
-					log.Printf("Alllocating !!!!\n")
 					ret.mci = NewMountCacheInfo(&ret.mountpoint)
-					log.Printf(".... Alllocated %p\n", ret.mci)
 				}
-				log.Print("UnLocked before")
 				ret.mumci.Unlock()
-				log.Print("UnLocked")
 			}
 			time.Sleep(2 * time.Second) // Check every 2seconds
 		}
